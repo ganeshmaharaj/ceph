@@ -61,6 +61,11 @@ void put_with_id(ReplicatedPG *pg, uint64_t id);
 
 struct inconsistent_snapset_wrapper;
 
+// modified by omw
+#include "osd/Dedup.h"
+#include "osdc/Objecter.h"
+struct C_DedupWrite_Commit;
+
 class ReplicatedPG : public PG, public PGBackend::Listener {
   friend class OSD;
   friend class Watch;
@@ -100,6 +105,8 @@ public:
     vector<pair<osd_reqid_t, version_t> > reqids; // [(reqid, user_version)]
     uint64_t truncate_seq;
     uint64_t truncate_size;
+    // modified by omw
+    bool need_dedup;
     bool is_data_digest() {
       return flags & object_copy_data_t::FLAG_DATA_DIGEST;
     }
@@ -114,7 +121,7 @@ public:
 	flags(0),
 	source_data_digest(-1), source_omap_digest(-1),
 	data_digest(-1), omap_digest(-1),
-	truncate_seq(0), truncate_size(0)
+	truncate_seq(0), truncate_size(0), need_dedup(false)
     {}
   };
 
@@ -150,6 +157,9 @@ public:
     unsigned src_obj_fadvise_flags;
     unsigned dest_obj_fadvise_flags;
 
+    // modified by omw
+    int copy_only_dedup_meta;
+
     CopyOp(CopyCallback *cb_, ObjectContextRef _obc, hobject_t s,
 	   object_locator_t l,
            version_t v,
@@ -167,6 +177,8 @@ public:
     {
       results.user_version = v;
       results.mirror_snapset = mirror_snapset;
+      // modified by omw
+      copy_only_dedup_meta = -1;
     }
   };
   typedef ceph::shared_ptr<CopyOp> CopyOpRef;
@@ -228,13 +240,17 @@ public:
     utime_t mtime;
     bool canceled;
     osd_reqid_t reqid;
+    // modified by omw
+    object_t oid_fp;
 
     ProxyWriteOp(OpRequestRef _op, hobject_t oid, vector<OSDOp>& _ops, osd_reqid_t _reqid)
       : ctx(NULL), op(_op), soid(oid),
         objecter_tid(0), ops(_ops),
 	user_version(0), sent_disk(false),
 	sent_ack(false), canceled(false),
-        reqid(_reqid) { }
+        reqid(_reqid) {}
+    ~ProxyWriteOp() {
+    }
   };
   typedef ceph::shared_ptr<ProxyWriteOp> ProxyWriteOpRef;
 
@@ -248,10 +264,12 @@ public:
     bool blocking;              ///< whether we are blocking updates
     bool removal;               ///< we are removing the backend object
     boost::optional<std::function<void()>> on_flush; ///< callback, may be null
+    // modified by omw
+    bool dedup;
 
     FlushOp()
       : flushed_version(0), objecter_tid(0), rval(0),
-	blocking(false), removal(false) {}
+	blocking(false), removal(false), dedup(false) {}
     ~FlushOp() { assert(!on_flush); }
   };
   typedef ceph::shared_ptr<FlushOp> FlushOpRef;
@@ -786,7 +804,7 @@ protected:
       assert(ctx->op->may_read());
       ctx->lock_type = ObjectContext::RWState::RWREAD;
     }
-
+    
     if (ctx->snapset_obc) {
       assert(!ctx->obc->obs.exists);
       if (!ctx->lock_manager.get_lock_type(
@@ -1177,6 +1195,7 @@ protected:
     BLOCKED_PROMOTE,
     HANDLED_PROXY,
     HANDLED_REDIRECT,
+    NEED_PROMOTE,
   };
   cache_result_t maybe_handle_cache_detail(OpRequestRef op,
 					   bool write_ordered,
@@ -1429,8 +1448,12 @@ protected:
   int get_pgls_filter(bufferlist::iterator& iter, PGLSFilter **pfilter);
 
   map<hobject_t, list<OpRequestRef>, hobject_t::BitwiseComparator> in_progress_proxy_ops;
+  map<hobject_t, list<OpRequestRef>, hobject_t::BitwiseComparator> blocked_dedup_ops;
   void kick_proxy_ops_blocked(hobject_t& soid);
   void cancel_proxy_ops(bool requeue);
+  
+  // modified by omw
+  map<ceph_tid_t, object_t> dedeupe_read_ops;
 
   // -- proxyread --
   map<ceph_tid_t, ProxyReadOpRef> proxyread_ops;
@@ -1447,6 +1470,9 @@ protected:
   void do_proxy_write(OpRequestRef op, const hobject_t& missing_oid);
   void finish_proxy_write(hobject_t oid, ceph_tid_t tid, int r);
   void cancel_proxy_write(ProxyWriteOpRef pwop);
+
+  // modified by omw
+  void finish_dedup_proxy_write(hobject_t oid, ceph_tid_t tid, int r);
 
   friend struct C_ProxyWrite_Apply;
   friend struct C_ProxyWrite_Commit;
@@ -1671,6 +1697,184 @@ public:
     ObjectContextRef obc,
     map<string, bufferlist> *out,
     bool user_only = false);
+
+  // modified by omw
+public:
+  /* basic operation */
+  cache_result_t do_dedup_r(OpRequestRef op);
+  cache_result_t do_dedup_w(OpRequestRef op, const hobject_t & missing_oid);
+  ceph_tid_t do_dedup_write(string oid_fp, OpRequestRef op, hobject_t * missing_oid, 
+			      ObjectOperation * o_op, uint64_t target_offset, uint64_t target_length);
+  void do_dedup_write_partial(OpRequestRef op);
+  void do_dedup_overwrite(OpRequestRef op, bufferlist & write_buf, 
+			  uint64_t real_offset, uint64_t real_length, bool need_chk_ref);
+  bool do_dedup_read(string oid_fp, OpRequestRef op, ObjectOperation *o_op, 
+				    uint64_t real_offset, uint64_t real_length);
+  void do_dedup_read_partial(OpRequestRef op);
+  bool do_dedup_full_read_and_write(string oid_fp, OpRequestRef op, ObjectOperation *o_op,
+				      uint64_t real_offset, uint64_t real_length);
+  void set_dedup_attr(string oid_fp, OpRequestRef op, ObjectOperation * o_op, bool cas);
+  ceph_tid_t dedup_dec_ref(hobject_t soid, object_t prev_oid, Context *fin, 
+					SnapContext &snapc, ceph::real_time mtime);
+  ceph_tid_t dedup_set_meta_info(hobject_t soid, object_t oid,  Context *fin, SnapContext &snapc, 
+				  ceph::real_time mtime, uint64_t offset);
+  void get_dedup_attr(string oid_str, OpRequestRef op, int next, bool cas);
+  void finish_dedup_proxy_read(hobject_t oid, ceph_tid_t tid, int r);
+  void kick_blocked_dedup_ops(hobject_t& soid);
+  /* misc */
+  void send_op_reply(hobject_t soid, OpRequestRef op);
+  int find_ops_index(vector<OSDOp> & ops, __le16 mode);
+  bool check_inprogress_op(OpRequestRef op);
+  void addop_dedup_xattr(ObjectOperation *w_obj_op, string name, bufferlist &list);
+  OSDOp& addop_dedup_read(ObjectOperation *r_obj_op, uint64_t offset, uint64_t length);
+  OSDOp& addop_dedup_write(ObjectOperation *w_obj_op, bufferlist &list);
+  bool get_op_rw_offset(OpRequestRef op, uint64_t &offset);
+  bool get_op_rw_length(OpRequestRef op, uint64_t &length);
+  void get_dedup_offset(uint64_t ori_offset, uint64_t ori_length, 
+				  uint64_t real_offset, uint64_t real_length,
+				  uint64_t &d_offset, uint64_t &d_length,
+				  uint64_t &s_offset);
+  bool need_bypass_oid(string oid_name);
+  bool is_target_op(OpRequestRef op);
+  void print_deduped_list(object_info_t &oi);
+  uint64_t get_dedup_index(uint64_t off);
+  /* reference counting */
+  int inc_ref_dedup(ObjectContextRef obc, PGBackend::PGTransaction *t);
+  int dec_ref_dedup(ObjectContextRef obc, OpContext *ctx, PGBackend::PGTransaction *t);
+  int get_ref_dedup(ObjectContextRef obc);
+  /* metadata */
+  bool search_fp(hobject_t soid, uint64_t offset, string &fp);
+  bool update_dedup_obj_meta(hobject_t soid, OpRequestRef op, string oid_fp, SnapContext &snapc,
+			      uint64_t real_offset, uint64_t real_length, bool sync);
+  void update_dedup_obj_meta_sync(hobject_t soid);
+  void promote_dedup_meta_object(ObjectContextRef obc,
+				    const hobject_t& missing_oid,
+				    const object_locator_t& oloc,
+				    OpRequestRef op);
+  /* writeback */
+  int do_dedup_flush(OpRequestRef op, const object_info_t& oi, const hobject_t& soid, 
+		      SnapContext &snapc, FlushOpRef fop);
+  void _copy_some_dedup(ObjectContextRef obc,CopyOpRef cop, C_GatherBuilder &gather, unsigned &flags);
+  int fill_in_copy_get_dedup(OpContext *ctx, bufferlist::iterator& bp, OSDOp& osd_op,
+			      ObjectContextRef &obc, bool classic, object_copy_cursor_t &cursor,
+			      uint64_t &out_max);
+  friend struct C_DedupRead;
+  friend struct C_DedupWrite_Commit;
+  friend struct C_DedupSetXattr_Commit;
+  friend struct C_DedupChkRef;
+};
+
+// modified by omw
+struct C_DedupWrite_Commit : public Context {
+  ReplicatedPGRef pg;
+  hobject_t oid; // ori oid
+  epoch_t last_peering_reset;
+  ceph_tid_t tid;
+  ReplicatedPG::ProxyWriteOpRef pwop;
+  string oid_fp;
+  int mode;
+  uint64_t real_offset;
+  uint64_t real_length;
+  ObjectOperation *o_op;
+  C_DedupWrite_Commit(ReplicatedPG *p, hobject_t o, epoch_t lpr,
+	              const ReplicatedPG::ProxyWriteOpRef& pw)
+    : pg(p), oid(o), last_peering_reset(lpr),
+      tid(0), pwop(pw), mode(0), real_offset(0), 
+      real_length(0), o_op(NULL)
+  { }
+  void finish(int r) {
+    generic_dout(20) << __func__ << " " << __LINE__ << " C_DedupWrite_Commit oid: " << oid 
+		    << " tid: " << tid << " r: " << r << dendl;
+    pg->lock();
+    if (pwop->canceled) {
+      pg->unlock();
+      return;
+    }
+    /* update dedup metadata */
+    if (pwop->op) {
+      MOSDOp *m = static_cast<MOSDOp*>(pwop->op->get_req());
+      assert(m);
+      /* fix me */
+      SnapContext snapc;
+      pg->update_dedup_obj_meta(oid, pwop->op, oid_fp, snapc, real_offset, real_length, false);
+      pg->update_dedup_obj_meta_sync(oid);
+    }
+
+    if (last_peering_reset == pg->get_last_peering_reset()) {
+      pg->finish_dedup_proxy_write(oid, tid, r);
+    }
+    pg->unlock();
+    if (o_op) {
+      delete o_op;
+    }
+  }
+};
+
+struct C_DedupSetXattr_Commit : public Context {
+  ReplicatedPGRef pg;
+  hobject_t oid;
+  epoch_t last_peering_reset;
+  ceph_tid_t tid;
+  ReplicatedPG::ProxyWriteOpRef pwop;
+  string oid_fp;
+  int mode;
+  C_DedupSetXattr_Commit(ReplicatedPG *p, hobject_t o, epoch_t lpr,
+	              const ReplicatedPG::ProxyWriteOpRef& pw)
+    : pg(p), oid(o), last_peering_reset(lpr),
+      tid(0), pwop(pw), mode(0)
+  {}
+  void finish(int r) {
+    if (pwop->canceled)
+      return;
+    generic_dout(0) << " C_DedupSetXattr_Commit " << __LINE__ << " oid: " << oid 
+		    << " tid: " << tid << " r: " << r << dendl;
+    assert(r >= 0);
+    pg->lock();
+    if (pwop->canceled) {
+      pg->unlock();
+      return;
+    }
+    if (last_peering_reset == pg->get_last_peering_reset()) {
+      pg->finish_dedup_proxy_write(oid, tid, r);
+    }
+    pg->unlock();
+  }
+};
+
+struct C_DedupChkRef : public Context {
+  ReplicatedPGRef pg;
+  hobject_t oid;
+  epoch_t last_peering_reset;
+  ceph_tid_t tid;
+  string oid_fp;
+  bufferlist write_buf;
+  OpRequestRef op;
+  int mode;
+  uint64_t real_offset;
+  uint64_t real_length;
+  C_DedupChkRef(ReplicatedPG *p, OpRequestRef op, hobject_t o, epoch_t lpr)
+    : pg(p), oid(o), last_peering_reset(lpr),
+      tid(0), op(op), mode(0)
+  {}
+  void finish(int r) {
+    generic_dout(20) << " C_DedupChkRef " << __LINE__ << " oid: " << oid 
+		    << " tid: " << tid << " r: " << r << dendl;
+    pg->lock();
+    if (r < 0) {
+      if (!write_buf.length()) {
+	assert(0);
+      }
+      ObjectOperation * obj_op = new ObjectOperation;
+      assert(obj_op);
+      pg->addop_dedup_write(obj_op, write_buf);
+      pg->do_dedup_write(oid_fp, op, NULL, obj_op, real_offset, real_length);
+      write_buf.clear();
+    } else {
+      pg->send_op_reply(oid, op);
+    } 
+    pg->unlock();
+  }
+
 };
 
 inline ostream& operator<<(ostream& out, ReplicatedPG::RepGather& repop)

@@ -1493,7 +1493,9 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
     return;
   }
 
-  ENCODE_START(24, 5, bl);
+  // modified by omw
+  //ENCODE_START(24, 5, bl);
+  ENCODE_START(25, 5, bl);
   ::encode(type, bl);
   ::encode(size, bl);
   ::encode(crush_ruleset, bl);
@@ -1542,6 +1544,12 @@ void pg_pool_t::encode(bufferlist& bl, uint64_t features) const
   ::encode(hit_set_grade_decay_rate, bl);
   ::encode(hit_set_search_last_n, bl);
   ::encode(opts, bl);
+  // modified by omw
+  ::encode(enable_dedup, bl);
+  ::encode(dedup_chunk_size, bl);
+  ::encode(chunk_method, bl);
+  ::encode(hash_method, bl);
+  ::encode(cas_pool, bl);
   ENCODE_FINISH(bl);
 }
 
@@ -1688,6 +1696,15 @@ void pg_pool_t::decode(bufferlist::iterator& bl)
   }
   if (struct_v >= 24) {
     ::decode(opts, bl);
+  }
+  // modified by omw
+  /* fixe me !!! */
+  if (struct_v >= 25) {
+    ::decode(enable_dedup, bl);
+    ::decode(dedup_chunk_size, bl);
+    ::decode(chunk_method, bl);
+    ::decode(hash_method, bl);
+    ::decode(cas_pool, bl);
   }
   DECODE_FINISH(bl);
   calc_pg_masks();
@@ -4733,6 +4750,11 @@ void object_info_t::encode(bufferlist& bl) const
   ::encode(local_mtime, bl);
   ::encode(data_digest, bl);
   ::encode(omap_digest, bl);
+  // modified by omw
+  if (flags & FLAG_DEDUPED) {
+    ::encode(deduped_info, bl);
+    ::encode(deduped_size, bl);
+  }
   ENCODE_FINISH(bl);
 }
 
@@ -4812,6 +4834,11 @@ void object_info_t::decode(bufferlist::iterator& bl)
     clear_flag(FLAG_DATA_DIGEST);
     clear_flag(FLAG_OMAP_DIGEST);
   }
+  // modified by omw
+  if (flags & FLAG_DEDUPED) {
+    ::decode(deduped_info, bl);
+    ::decode(deduped_size, bl);
+  }
   DECODE_FINISH(bl);
 }
 
@@ -4875,6 +4902,39 @@ ostream& operator<<(ostream& out, const object_info_t& oi)
   out << ")";
   return out;
 }
+
+// -- dedup_chunk_info_t --
+
+void dedup_chunk_info_t::encode(bufferlist& bl) const
+{
+  ENCODE_START(1, 1, bl);
+  ::encode(length, bl);
+  ::encode(oid_fp, bl);
+  ::encode(cas_pool, bl);
+  ::encode(chk_state, bl);
+  ENCODE_FINISH(bl);
+}
+
+void dedup_chunk_info_t::decode(bufferlist::iterator &bl)
+{
+  DECODE_START(1, bl);
+  ::decode(length, bl);
+  ::decode(oid_fp, bl);
+  ::decode(cas_pool, bl);
+  ::decode(chk_state, bl);
+  DECODE_FINISH(bl);
+}
+
+#if 0
+void object_copy_cursor_t::dump(Formatter *f) const
+{
+  f->dump_unsigned("attr_complete", (int)attr_complete);
+  f->dump_unsigned("data_offset", data_offset);
+  f->dump_unsigned("data_complete", (int)data_complete);
+  f->dump_string("omap_offset", omap_offset);
+  f->dump_unsigned("omap_complete", (int)omap_complete);
+}
+#endif
 
 // -- ObjectRecovery --
 void ObjectRecoveryProgress::encode(bufferlist &bl) const

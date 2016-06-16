@@ -7137,6 +7137,159 @@ done:
     wait_for_finished_proposal(op, new Monitor::C_Command(mon, op, 0, ss.str(),
 					      get_last_committed() + 1));
     return true;
+  // modified by omw
+  } else if (prefix == "osd tier add_cas") {
+    err = check_cluster_features(CEPH_FEATURE_OSD_CACHEPOOL, ss);
+    if (err == -EAGAIN)
+      goto wait;
+    if (err)
+      goto reply;
+    string poolstr;
+    cmd_getval(g_ceph_context, cmdmap, "pool", poolstr);
+    int64_t pool_id = osdmap.lookup_pg_pool_name(poolstr);
+    if (pool_id < 0) {
+      ss << "unrecognized pool '" << poolstr << "'";
+      err = -ENOENT;
+      goto reply;
+    }
+    string tierpoolstr;
+    cmd_getval(g_ceph_context, cmdmap, "tierpool", tierpoolstr);
+    int64_t tierpool_id = osdmap.lookup_pg_pool_name(tierpoolstr);
+    if (tierpool_id < 0) {
+      ss << "unrecognized pool '" << tierpoolstr << "'";
+      err = -ENOENT;
+      goto reply;
+    }
+    string caspoolstr;
+    cmd_getval(g_ceph_context, cmdmap, "caspool", caspoolstr);
+    int64_t caspool_id = osdmap.lookup_pg_pool_name(caspoolstr);
+    if (tierpool_id < 0) {
+      ss << "unrecognized pool '" << caspoolstr << "'";
+      err = -ENOENT;
+      goto reply;
+    }
+
+    const pg_pool_t *p = osdmap.get_pg_pool(pool_id);
+    assert(p);
+    const pg_pool_t *tp = osdmap.get_pg_pool(tierpool_id);
+    assert(tp);
+    const pg_pool_t *cas_tp = osdmap.get_pg_pool(caspool_id);
+    assert(tp);
+
+    if (!_check_become_tier(tierpool_id, tp, pool_id, p, &err, &ss)) {
+      goto reply;
+    }
+
+    // make sure new tier is empty
+    string force_nonempty;
+    cmd_getval(g_ceph_context, cmdmap, "force_nonempty", force_nonempty);
+    const pool_stat_t& tier_stats =
+      mon->pgmon()->pg_map.get_pg_pool_sum_stat(tierpool_id);
+    if (tier_stats.stats.sum.num_objects != 0 &&
+	force_nonempty != "--force-nonempty") {
+      ss << "tier pool '" << tierpoolstr << "' is not empty; --force-nonempty to force";
+      err = -ENOTEMPTY;
+      goto reply;
+    }
+    if (tp->ec_pool()) {
+      ss << "tier pool '" << tierpoolstr
+	 << "' is an ec pool, which cannot be a tier";
+      err = -ENOTSUP;
+      goto reply;
+    }
+    if ((!tp->removed_snaps.empty() || !tp->snaps.empty()) &&
+	((force_nonempty != "--force-nonempty") ||
+	 (!g_conf->mon_debug_unsafe_allow_tier_with_nonempty_snaps))) {
+      ss << "tier pool '" << tierpoolstr << "' has snapshot state; it cannot be added as a tier without breaking the pool";
+      err = -ENOTEMPTY;
+      goto reply;
+    }
+    // go
+    pg_pool_t *np = pending_inc.get_new_pool(pool_id, p);
+    pg_pool_t *ntp = pending_inc.get_new_pool(tierpool_id, tp);
+    if (np->tiers.count(tierpool_id) || ntp->is_tier()) {
+      wait_for_finished_proposal(op, new C_RetryMessage(this, op));
+      return true;
+    }
+    np->tiers.insert(tierpool_id);
+    np->set_snap_epoch(pending_inc.epoch); // tier will update to our snap info
+    ntp->tier_of = pool_id;
+    ntp->cas_pool = caspool_id;
+    ss << "pool '" << tierpoolstr << "' is now (or already was) a tier of '" << poolstr << "'" << " cas pool " << caspoolstr;
+    wait_for_finished_proposal(op, new Monitor::C_Command(mon, op, 0, ss.str(),
+					      get_last_committed() + 1));
+    return true;
+  // modified by omw
+  } else if (prefix == "osd tier dedup_block") {
+    err = check_cluster_features(CEPH_FEATURE_OSD_CACHEPOOL, ss);
+    if (err == -EAGAIN)
+      goto wait;
+    if (err)
+      goto reply;
+    string poolstr;
+    cmd_getval(g_ceph_context, cmdmap, "pool", poolstr);
+    int64_t pool_id = osdmap.lookup_pg_pool_name(poolstr);
+    if (pool_id < 0) {
+      ss << "unrecognized pool '" << poolstr << "'";
+      err = -ENOENT;
+      goto reply;
+    }
+    string tierpoolstr;
+    cmd_getval(g_ceph_context, cmdmap, "tierpool", tierpoolstr);
+    int64_t tierpool_id = osdmap.lookup_pg_pool_name(tierpoolstr);
+    if (tierpool_id < 0) {
+      ss << "unrecognized pool '" << tierpoolstr << "'";
+      err = -ENOENT;
+      goto reply;
+    }
+    string caspoolstr;
+    cmd_getval(g_ceph_context, cmdmap, "caspool", caspoolstr);
+    int64_t caspool_id = osdmap.lookup_pg_pool_name(caspoolstr);
+    if (tierpool_id < 0) {
+      ss << "unrecognized pool '" << caspoolstr << "'";
+      err = -ENOENT;
+      goto reply;
+    }
+    int64_t dedup_chunk_size = 0;
+    cmd_getval(g_ceph_context, cmdmap, "block_size", dedup_chunk_size, int64_t(0));
+
+    const pg_pool_t *p = osdmap.get_pg_pool(pool_id);
+    assert(p);
+    const pg_pool_t *tp = osdmap.get_pg_pool(tierpool_id);
+    assert(tp);
+    const pg_pool_t *cas_tp = osdmap.get_pg_pool(caspool_id);
+    assert(cas_tp);
+
+#if 0
+    if (!_check_become_tier(tierpool_id, tp, pool_id, p, &err, &ss)) {
+      goto reply;
+    }
+#endif
+
+    // go
+    pg_pool_t *np = pending_inc.get_new_pool(pool_id, p);
+    pg_pool_t *ntp = pending_inc.get_new_pool(tierpool_id, tp);
+    pg_pool_t *cas_ntp = pending_inc.get_new_pool(tierpool_id, cas_tp);
+#if 0
+    if (np->tiers.count(tierpool_id) || ntp->is_tier()) {
+      wait_for_finished_proposal(op, new C_RetryMessage(this, op));
+      return true;
+    }
+    np->tiers.insert(tierpool_id);
+    np->set_snap_epoch(pending_inc.epoch); // tier will update to our snap info
+    //ntp->tier_of = pool_id;
+    //ntp->cas_pool = caspool_id;
+#endif
+    np->dedup_chunk_size = dedup_chunk_size;
+    ntp->dedup_chunk_size = dedup_chunk_size;
+    cas_ntp->dedup_chunk_size = dedup_chunk_size;
+    np->enable_dedup = true;
+    ntp->enable_dedup = true;
+    cas_ntp->enable_dedup = true;
+    ss << "pool '" << tierpoolstr << "' is now (or already was) a tier of '" << poolstr << "'" << " cas pool " << caspoolstr << " block size " << dedup_chunk_size;
+    wait_for_finished_proposal(op, new Monitor::C_Command(mon, op, 0, ss.str(),
+					      get_last_committed() + 1));
+    return true;
   } else if (prefix == "osd tier remove" ||
              prefix == "osd tier rm") {
     string poolstr;

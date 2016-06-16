@@ -88,6 +88,9 @@ static ostream& _prefix(std::ostream *_dout, T *pg) {
 
 #include <errno.h>
 
+#include "osd/Dedup.h"
+#include "osdc/Objecter.h"
+
 PGLSFilter::PGLSFilter()
 {
 }
@@ -1448,6 +1451,7 @@ void ReplicatedPG::do_request(
   if (can_discard_request(op)) {
     return;
   }
+
   if (flushes_in_progress > 0) {
     dout(20) << flushes_in_progress
 	     << " flushes_in_progress pending "
@@ -1790,40 +1794,44 @@ void ReplicatedPG::do_op(OpRequestRef& op)
     return;
   }
 
-  // dup/replay?
-  if (op->may_write() || op->may_cache()) {
-    // warning: we will get back *a* request for this reqid, but not
-    // necessarily the most recent.  this happens with flush and
-    // promote ops, but we can't possible have both in our log where
-    // the original request is still not stable on disk, so for our
-    // purposes here it doesn't matter which one we get.
-    eversion_t replay_version;
-    version_t user_version;
-    bool got = pg_log.get_log().get_request(
-      m->get_reqid(), &replay_version, &user_version);
-    if (got) {
-      dout(3) << __func__ << " dup " << m->get_reqid()
-	      << " was " << replay_version << dendl;
-      if (already_complete(replay_version)) {
-	osd->reply_op_error(op, 0, replay_version, user_version);
-      } else {
-	if (m->wants_ack()) {
-	  if (already_ack(replay_version)) {
-	    MOSDOpReply *reply = new MOSDOpReply(m, 0, get_osdmap()->get_epoch(), 0, false);
-	    reply->add_flags(CEPH_OSD_FLAG_ACK);
-	    reply->set_reply_versions(replay_version, user_version);
-	    osd->send_message_osd_client(reply, m->get_connection());
-	  } else {
-	    dout(10) << " waiting for " << replay_version << " to ack" << dendl;
-	    waiting_for_ack[replay_version].push_back(make_pair(op, user_version));
+  /* fix me 
+     dedup osd can receive replicated req_id */
+  if (!(m->get_flags() & CEPH_OSD_FLAG_DEDUPE_WRITE) && !(m->get_flags() & CEPH_OSD_FLAG_DEDUPE_READ)) {
+    // dup/replay?
+    if (op->may_write() || op->may_cache()) {
+      // warning: we will get back *a* request for this reqid, but not
+      // necessarily the most recent.  this happens with flush and
+      // promote ops, but we can't possible have both in our log where
+      // the original request is still not stable on disk, so for our
+      // purposes here it doesn't matter which one we get.
+      eversion_t replay_version;
+      version_t user_version;
+      bool got = pg_log.get_log().get_request(
+	m->get_reqid(), &replay_version, &user_version);
+      if (got) {
+	dout(3) << __func__ << " dup " << m->get_reqid()
+		<< " was " << replay_version << dendl;
+	if (already_complete(replay_version)) {
+	  osd->reply_op_error(op, 0, replay_version, user_version);
+	} else {
+	  if (m->wants_ack()) {
+	    if (already_ack(replay_version)) {
+	      MOSDOpReply *reply = new MOSDOpReply(m, 0, get_osdmap()->get_epoch(), 0, false);
+	      reply->add_flags(CEPH_OSD_FLAG_ACK);
+	      reply->set_reply_versions(replay_version, user_version);
+	      osd->send_message_osd_client(reply, m->get_connection());
+	    } else {
+	      dout(10) << " waiting for " << replay_version << " to ack" << dendl;
+	      waiting_for_ack[replay_version].push_back(make_pair(op, user_version));
+	    }
 	  }
+	  dout(10) << " waiting for " << replay_version << " to commit" << dendl;
+	  // always queue ondisk waiters, so that we can requeue if needed
+	  waiting_for_ondisk[replay_version].push_back(make_pair(op, user_version));
+	  op->mark_delayed("waiting for ondisk");
 	}
-	dout(10) << " waiting for " << replay_version << " to commit" << dendl;
-        // always queue ondisk waiters, so that we can requeue if needed
-	waiting_for_ondisk[replay_version].push_back(make_pair(op, user_version));
-	op->mark_delayed("waiting for ondisk");
+	return;
       }
-      return;
     }
   }
 
@@ -2076,8 +2084,10 @@ void ReplicatedPG::do_op(OpRequestRef& op)
 
   if (m->has_flag(CEPH_OSD_FLAG_SKIPRWLOCKS)) {
     dout(20) << __func__ << ": skipping rw locks" << dendl;
+    dout(0) << __func__ << ": skipping rw locks" << dendl;
   } else if (m->get_flags() & CEPH_OSD_FLAG_FLUSH) {
     dout(20) << __func__ << ": part of flush, will ignore write lock" << dendl;
+    dout(0) << __func__ << ": part of flush, will ignore write lock" << dendl;
 
     // verify there is in fact a flush in progress
     // FIXME: we could make this a stronger test.
@@ -2089,6 +2099,7 @@ void ReplicatedPG::do_op(OpRequestRef& op)
     }
   } else if (!get_rw_locks(write_ordered, ctx)) {
     dout(20) << __func__ << " waiting for rw locks " << dendl;
+    dout(0) << __func__ << " waiting for rw locks " << dendl;
     op->mark_delayed("waiting for rw locks");
     close_op_ctx(ctx);
     return;
@@ -2148,6 +2159,1172 @@ void ReplicatedPG::do_op(OpRequestRef& op)
   }
 }
 
+// modified by omw
+class C_DedupGetAttrs : public Context
+{
+public:
+  map<string,bufferlist> attrset;
+  ceph_tid_t tid;
+  OpRequestRef op;
+  int next_op;
+  ReplicatedPG * pg;
+  string oid_fp;
+  hobject_t soid;
+  void finish(int r) {
+    assert(pg);
+
+    pg->lock();
+    generic_dout(20) << " C_DedupGetAttrs attrset len: " << attrset.size() << dendl;
+    if (next_op == DEDUPE_WRITE) {
+      /* miss
+       * input data is needed to store new data in storage tier
+       */
+      object_t oid(oid_fp);
+      if (attrset.empty()) {
+	generic_dout(0) << __func__ << " C_DedupGetAttrs empty oid: " << oid_fp << dendl;
+	ObjectOperation * osd_op = new ObjectOperation;
+	uint64_t offset, length;
+	assert(pg->get_op_rw_offset(op, offset));
+	assert(pg->get_op_rw_length(op, length));
+	pg->do_dedup_write(oid_fp, op, NULL, osd_op, offset, length);
+      } else {
+	/* send reference op if data exist in storage tier */
+	ObjectOperation obj_op;
+	bufferlist list;
+	::encode(oid, list);
+	pg->addop_dedup_xattr(&obj_op, REFERENCE_OID, list);
+	pg->set_dedup_attr(oid_fp, op, &obj_op, true);
+      }
+      pg->finish_dedup_proxy_read(soid, tid, r);
+    } else if (next_op == DEDUPE_READ) {
+      /* need to add cache */
+      if (attrset.find(DEDUPE_INFO) != attrset.end()) {
+	map<uint64_t, dedup_chunk_info_t>  deduped_info;
+	uint64_t off;
+	uint64_t d_chunk_size = pg->get_pool().dedup_chunk_size;
+	string oid_fp;
+	bufferlist::iterator pp = attrset[DEDUPE_INFO].begin();
+	::decode(deduped_info, pp);
+	pg->get_op_rw_offset(op, off);
+	off = pg->get_dedup_index(off);
+	oid_fp = deduped_info[off].oid_fp;
+	generic_dout(0) << " C_DedupGetAttrs oid: " << oid_fp << dendl;
+	ObjectOperation *o_op = new ObjectOperation;
+	assert(o_op);
+	pg->addop_dedup_read(o_op, 0, d_chunk_size);
+	pg->do_dedup_read(oid_fp, op, o_op, (off*d_chunk_size), d_chunk_size);	
+	pg->finish_dedup_proxy_read(soid, tid, r);
+      } else {
+	generic_dout(0) << " C_DedupGetAttrs no DEDUPE_INFO " << dendl;
+	pg->finish_dedup_proxy_read(soid, tid, -1);
+      }
+    } 
+    pg->unlock();
+  }
+};
+
+struct C_DedupRead : public Context {
+  ReplicatedPGRef pg;
+  hobject_t oid;
+  epoch_t last_peering_reset;
+  ceph_tid_t tid;
+  ReplicatedPG::ProxyReadOpRef prdop;
+  ObjectOperation *o_op;
+  utime_t start;
+  string oid_fp;
+  int next_op;
+  uint64_t real_offset;
+  uint64_t real_length;
+  C_DedupRead(ReplicatedPG *p, hobject_t o, epoch_t lpr,
+	     const ReplicatedPG::ProxyReadOpRef& prd)
+    : pg(p), oid(o), last_peering_reset(lpr),
+      tid(0), prdop(prd), start(ceph_clock_now(NULL)), next_op(0),
+      real_offset(0), real_length(0)
+  {}
+  void finish(int r) {
+    assert(o_op);
+    assert(real_length);
+
+    pg->lock();
+    if (prdop->canceled) {
+      pg->unlock();
+      return;
+    }
+    if (next_op == DEDUPE_OVERWRITE) {
+      do_dedup_overwrite_from_read(r);
+    } else {
+      if (last_peering_reset == pg->get_last_peering_reset()) {
+	/* Find out original the message */
+	int r_index = pg->find_ops_index(prdop->ops, CEPH_OSD_OP_READ);
+	assert(r_index != -1);
+	int dedup_r_index = pg->find_ops_index(o_op->ops, CEPH_OSD_OP_READ);
+	uint64_t d_chunk_size = pg->get_pool().dedup_chunk_size;
+	uint64_t t_offset = 0, t_length = 0, s_offset = 0;
+	uint64_t ori_offset = prdop->ops[r_index].op.extent.offset;
+	uint64_t ori_length = prdop->ops[r_index].op.extent.length;
+
+	pg->get_dedup_offset(ori_offset, ori_length, real_offset, real_length,
+			  t_offset, t_length, s_offset);
+
+	generic_dout(20) << " C_DedupRead " << " oid: " << oid << " tid: " << tid 
+		<< " read data length: " << o_op->ops[r_index].outdata.length()
+		<< " result: " << r << " ori_offset: " << ori_offset 
+		<< " ori_length: " << ori_length << " t_offset: " << t_offset << " t_length: "
+		<< t_length << " s_offset: " << s_offset  << " real_offset: " << real_offset
+		<< " real_length: " << real_length << dendl;
+
+	if (o_op->ops[dedup_r_index].op.extent.length < d_chunk_size) {
+	  prdop->ops[r_index].outdata.append(
+		    o_op->ops[dedup_r_index].outdata);
+	} else {
+	  bufferlist list;
+	  bufferptr bptr(t_length);
+	  list.push_back(std::move(bptr));
+	  list.copy_in(s_offset, t_length, 
+			o_op->ops[dedup_r_index].outdata.c_str() + t_offset);
+	  prdop->ops[r_index].outdata.append(list);
+	}
+	pg->finish_dedup_proxy_read(oid, tid, r);
+      }
+    }
+    if (o_op) {
+      delete o_op;
+    }
+    pg->unlock();
+  }
+
+  void do_dedup_overwrite_from_read(int r) {
+      int r_index = -1;
+      assert(o_op);
+      assert(prdop->op);
+      assert(prdop->ops.size());
+
+      r_index = pg->find_ops_index(o_op->ops, CEPH_OSD_OP_READ);
+      if (r_index == -1 || !o_op->ops[r_index].outdata.length()) {
+	assert(0);
+      }
+      generic_dout(20) << __func__ << " oid: " << oid << " tid: " << tid 
+		      << " data lengh: " << o_op->ops[r_index].outdata.length() 
+		      << " result: " << r << dendl;
+      pg->do_dedup_overwrite(prdop->op, o_op->ops[r_index].outdata, real_offset, real_length, false);
+
+      pg->finish_dedup_proxy_read(oid, tid, r);
+  }
+
+};
+
+int ReplicatedPG::get_ref_dedup(
+  ObjectContextRef obc)
+{
+  int r = 0;
+  bufferlist old;
+  string ref_key = REFERENCE_KEY;
+  string name = "_" + ref_key;
+  r = pgbackend->objects_get_attr(obc->obs.oi.soid, name, &old);
+  return r;
+}
+
+int ReplicatedPG::inc_ref_dedup(
+  ObjectContextRef obc,
+  PGBackend::PGTransaction *t)
+{
+  bufferlist old, bl;
+  int r, result = 0;
+  int value = -1, prev_value = -1;
+  string ref_key = REFERENCE_KEY;
+  string name = "_" + ref_key;
+  assert(obc);
+  //r = getattr_maybe_cache(ctx->obc, name, &old);
+  r = pgbackend->objects_get_attr(obc->obs.oi.soid, name, &old);
+  if (r < 0) {
+    value = 1;
+    ::encode(value, bl);
+  } else {
+    bufferlist::iterator p = old.begin();
+    ::decode(value, p);
+    prev_value = value;
+    value++;
+    ::encode(value, bl);
+  }
+  //setattr_maybe_cache(ctx->obc, ctx, t, name, bl);
+  t->setattr(obc->obs.oi.soid, name, bl);
+  dout(20) << __func__ << " " << __LINE__ << " name: " <<  name 
+	  << " prev value: " << prev_value << " next value: " << value 
+	  << " r: " << r << dendl;
+  return result;
+}
+
+int ReplicatedPG::dec_ref_dedup(
+  ObjectContextRef obc,
+  OpContext *ctx,
+  PGBackend::PGTransaction *t)
+{
+  bufferlist old, bl;
+  int r, result = 0;
+  int value = -1, prev_value = -1;
+  string ref_key = REFERENCE_KEY;
+  string name = "_" + ref_key;
+  //r = getattr_maybe_cache(ctx->obc, name, &old);
+  r = pgbackend->objects_get_attr(obc->obs.oi.soid, name, &old);
+  if (r >= 0) {
+    bufferlist::iterator p = old.begin();
+    ::decode(value, p);
+    prev_value = value;
+    value--;
+    ::encode(value, bl);
+  } else {
+    value = 0;
+  }
+  /* fix me r<0 <- delete!! */
+  if (r < 0 || value == 0) {
+    result = _delete_oid(ctx, ctx->ignore_cache);
+  } else {
+    //setattr_maybe_cache(ctx->obc, ctx, t, name, bl);
+    t->setattr(obc->obs.oi.soid, name, bl);
+  }
+  dout(20) << __func__ << " " << __LINE__ << " name: " <<  name 
+	  << " prev value: " << prev_value << " next value: " << value 
+	  << " r: " << r << " result: " << result << dendl;
+  return result;
+}
+
+OSDOp& ReplicatedPG::addop_dedup_write(ObjectOperation *w_obj_op, bufferlist &list)
+{
+  OSDOp &osd_op_alloc = w_obj_op->add_op(CEPH_OSD_OP_SETALLOCHINT);
+  uint64_t d_chunk_size = get_pool().dedup_chunk_size;
+  osd_op_alloc.op.alloc_hint.expected_object_size = d_chunk_size;
+  osd_op_alloc.op.alloc_hint.expected_write_size = d_chunk_size;
+
+  OSDOp &osd_op = w_obj_op->add_op(CEPH_OSD_OP_WRITE);
+  osd_op.op.extent.offset = 0;
+  osd_op.op.extent.length = list.length();
+  osd_op.indata.append(list);
+  return osd_op;
+}
+
+OSDOp& ReplicatedPG::addop_dedup_read(ObjectOperation *r_obj_op, uint64_t offset, uint64_t length)
+{
+  OSDOp &osd_op = r_obj_op->add_op(CEPH_OSD_OP_READ);
+  osd_op.op.extent.offset = offset;
+  osd_op.op.extent.length = length;
+  return osd_op;
+}
+
+void ReplicatedPG::addop_dedup_xattr(ObjectOperation *w_obj_op, string name, bufferlist &list)
+{
+  assert(w_obj_op);
+  OSDOp &osd_op = w_obj_op->add_op(CEPH_OSD_OP_DEDUPE_SETXATTRS);
+  osd_op.op.xattr.name_len = name.length();
+  osd_op.op.xattr.value_len = list.length();
+  osd_op.indata.append(name);
+  osd_op.indata.append(list);
+}
+
+int ReplicatedPG::find_ops_index(vector<OSDOp> & ops, __le16 mode)
+{
+  for (uint32_t i = 0; i < ops.size(); i++) {
+    
+    dout(20) << __func__ << " " << __LINE__ << " " <<  " i : " 
+	    << i << " op : " <<  ops[i].op.op << dendl;
+    if (ops[i].op.op == mode) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+bool ReplicatedPG::check_inprogress_op(OpRequestRef op)
+{
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  object_locator_t oloc(m->get_object_locator());
+  oloc.pool = pool.info.tier_of;
+  hobject_t soid(m->get_oid(),
+		 m->get_object_locator().key,
+		 m->get_snapid(),
+		 m->get_pg().ps(),
+		 m->get_object_locator().get_pool(),
+		 m->get_object_locator().nspace);
+  
+  if (in_progress_proxy_ops[soid].empty()) {
+    return false;
+  }
+  
+  if (op->may_write()) {
+    dout(0) << __func__ << " blocked op: " << *m << dendl;
+    blocked_dedup_ops[soid].push_back(op);
+    return true;
+  } else if (op->may_read()) {
+    map<hobject_t, list<OpRequestRef>, hobject_t::BitwiseComparator>::iterator q = in_progress_proxy_ops.find(soid);
+    for (list<OpRequestRef>::iterator it = q->second.begin(); it != q->second.end();
+						++it) {
+      OpRequestRef prev_op = *it;
+      if (prev_op->may_write()) {
+	dout(0) << __func__ << " blocked op: " << *m << dendl;
+	blocked_dedup_ops[soid].push_back(op);
+	return true;
+      }
+    }
+  }
+  return false;
+}
+
+ReplicatedPG::cache_result_t ReplicatedPG::do_dedup_r(OpRequestRef op) 
+{
+  uint64_t offset, length;
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  assert(get_op_rw_offset(op, offset));
+  assert(get_op_rw_length(op, length));
+
+  if (check_inprogress_op(op)) {
+    return cache_result_t::HANDLED_PROXY;
+  } 
+
+  ObjectContextRef obc;
+  hobject_t soid(m->get_oid(),
+		 m->get_object_locator().key,
+		 m->get_snapid(),
+		 m->get_pg().ps(),
+		 m->get_object_locator().get_pool(),
+		 m->get_object_locator().nspace);
+  obc = get_object_context(soid, false);
+  if (!obc || !obc->obs.exists) {
+    object_locator_t oloc(m->get_object_locator());
+    oloc.pool = pool.info.tier_of;
+    promote_dedup_meta_object(NULL, soid, oloc, op);
+    return cache_result_t::BLOCKED_PROMOTE;
+  }
+
+  uint64_t off;
+  string oid_fp;
+  get_op_rw_offset(op, off);
+  off = get_dedup_index(off);
+  if (obc->obs.oi.deduped_info.find(off) != obc->obs.oi.deduped_info.end()) {
+    oid_fp = obc->obs.oi.deduped_info[off].oid_fp;
+  }
+
+  dout(15) << __func__ << " oid: " << soid.oid.name << " oid_fp: " <<  oid_fp << dendl;
+  if (oid_fp.empty()) {
+    do_proxy_read(op);
+    return cache_result_t::HANDLED_PROXY;
+  }
+  do_dedup_read_partial(op);
+  dout(20) << __func__ << " " << __LINE__ << " out! " << dendl;
+  return cache_result_t::HANDLED_PROXY;
+}
+
+ReplicatedPG::cache_result_t ReplicatedPG::do_dedup_w(OpRequestRef op, const hobject_t &missing_oid) 
+{
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  uint64_t offset, length;
+  assert(get_op_rw_offset(op, offset));
+  assert(get_op_rw_length(op, length));
+
+  if (check_inprogress_op(op)) {
+    return cache_result_t::HANDLED_PROXY;
+  } 
+
+  ObjectContextRef obc;
+  hobject_t soid(m->get_oid(),
+		 m->get_object_locator().key,
+		 m->get_snapid(),
+		 m->get_pg().ps(),
+		 m->get_object_locator().get_pool(),
+		 m->get_object_locator().nspace);
+  obc = get_object_context(soid, false);
+  assert(obc);
+  if (!obc->obs.exists) {
+    object_locator_t oloc(m->get_object_locator());
+    oloc.pool = pool.info.tier_of;
+    promote_dedup_meta_object(NULL, soid, oloc, op);
+    return cache_result_t::BLOCKED_PROMOTE;
+  }
+
+  do_dedup_write_partial(op);
+
+  dout(20) << __func__ << " " << __LINE__ << " out! " << dendl;
+  return cache_result_t::HANDLED_PROXY;
+}
+
+/* check if message is for RBD metadata */
+bool ReplicatedPG::need_bypass_oid(string oid_name)
+{
+  if (oid_name.find('.') <= 0)  
+    return true;
+  string sub = oid_name.substr(0, strlen("rbd_id"));
+  if (!sub.compare("rbd_id")) {
+    dout(20) << __func__ << " oid_name: " << oid_name << " sub: " << sub << dendl;
+    return true;
+  }
+  int size = oid_name.find_last_of('.');
+  if (size > 2) {
+    sub = oid_name.substr(size+1);
+    if (!sub.compare("rbd")) {
+      dout(20) << __func__ << " oid_name: " << oid_name << " sub: " << sub << dendl;
+      return true;
+    }
+  }
+  sub = oid_name.substr(0, strlen("rbd_directory"));
+  if (!sub.compare("rbd_directory")) {
+    dout(20) << __func__ << " oid_name: " << oid_name << " sub: " << sub << dendl;
+    return true;
+  }
+  return false;  
+}
+
+bool ReplicatedPG::is_target_op(OpRequestRef op)
+{
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  if (!m || !m->ops.size()) {
+    return false;
+  }
+  for (vector<OSDOp>::iterator p = m->ops.begin(); p != m->ops.end(); ++p) {
+    OSDOp& osd_op = *p;
+    ceph_osd_op& ceph_op = osd_op.op;
+    dout(20) << " ceph op: " << ceph_op.op << dendl;
+    switch (ceph_op.op) {
+      case CEPH_OSD_OP_READ: 
+      case CEPH_OSD_OP_WRITE:
+      case CEPH_OSD_OP_SETALLOCHINT:
+	dout(20) << " ceph op: " << ceph_op.op << "offset: " << ceph_op.extent.offset << " length: " 
+		<< ceph_op.extent.length << dendl; 
+	if (m->ops.size() > 2) {
+	  return false;
+	}
+	break;
+      default:
+	return false;
+    }
+  }
+
+  string oid_name = m->get_oid().name;
+  if (need_bypass_oid(oid_name)) {
+    return false;
+  }
+
+  return true;
+}
+
+void ReplicatedPG::do_dedup_read_partial(OpRequestRef op) {
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  object_t oid = m->get_oid();
+  bufferlist list; 
+  uint64_t offset, length, dedup_offset, dedup_length, cursor = 0, dedup_index = 0, remain = 0;
+  uint64_t d_chunk_size = get_pool().dedup_chunk_size;
+  assert(get_op_rw_offset(op, offset));
+  assert(get_op_rw_length(op, length));
+
+  remain = offset % d_chunk_size;
+  dedup_offset = offset - remain;
+
+  remain = (offset + length) % d_chunk_size;
+  if (remain) {
+    remain = d_chunk_size - remain;
+  }
+  /* Original data |** |  |: chunking boundary*/
+  if (dedup_offset + d_chunk_size >= offset + length) {
+    dedup_length = d_chunk_size;
+  /* Original data |***|** | */
+  } else {
+    dedup_length = offset + length + remain - dedup_offset;
+  }
+
+  cursor = dedup_offset;
+
+  ObjectContextRef obc;
+  hobject_t soid(m->get_oid(),
+		 m->get_object_locator().key,
+		 m->get_snapid(),
+		 m->get_pg().ps(),
+		 m->get_object_locator().get_pool(),
+		 m->get_object_locator().nspace);
+  obc = get_object_context(soid, false);
+  assert(obc);
+
+  if (cursor >= dedup_offset + dedup_length) {
+    assert(0);
+  }
+
+  for (; cursor < dedup_offset + dedup_length; ) {
+    string oid_fp;
+    dedup_index = get_dedup_index(cursor);
+    if (obc->obs.oi.deduped_info.find(dedup_index) != obc->obs.oi.deduped_info.end()) {
+      oid_fp = obc->obs.oi.deduped_info[dedup_index].oid_fp;
+    }
+
+    dout(15) << __func__ << " oid: " << oid << " oid_fp: " << oid_fp << " remain: " << remain 
+	    << " cursor: " << cursor << " dedup index: " << dedup_index 
+	    << " dedup_offset: " << dedup_offset << " dedup_length: " << dedup_length 
+	    << " d_chunk_size: " << d_chunk_size << dendl;
+
+    if (oid_fp.empty()) {
+      do_proxy_read(op);
+    } else {
+      ObjectOperation *o_op = new ObjectOperation;
+      assert(o_op);
+      uint64_t d_offset, d_length, s_offset;
+      get_dedup_offset(offset, length, cursor, d_chunk_size,
+			d_offset, d_length, s_offset);
+      addop_dedup_read(o_op, d_offset, d_length);
+      dout(15) << __func__ << " send read offset: " << cursor << " length: " << d_chunk_size << dendl;
+      do_dedup_read(oid_fp, op, o_op, cursor, d_chunk_size);
+    }
+
+    cursor += d_chunk_size;
+  }
+}
+
+void ReplicatedPG::do_dedup_write_partial(OpRequestRef op) {
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  object_t oid = m->get_oid();
+  bufferlist list; 
+  uint64_t offset, length, dedup_offset = 0, dedup_length = 0, cursor = 0, dedup_index = 0, remain = 0;
+  uint64_t d_chunk_size = get_pool().dedup_chunk_size;
+  assert(get_op_rw_offset(op, offset));
+  assert(get_op_rw_length(op, length));
+
+  remain = offset % d_chunk_size;
+  dedup_offset = offset - remain;
+
+  remain = (offset + length) % d_chunk_size;
+  if (remain) {
+    remain = d_chunk_size - remain;
+  }
+  /* Original data |** |  |: chunking boundary*/
+  if (dedup_offset + d_chunk_size >= offset + length) {
+    dedup_length = d_chunk_size;
+  /* Original data |***|** | */
+  } else {
+    dedup_length = offset + length + remain - dedup_offset;
+  }
+
+  cursor = dedup_offset;
+
+  ObjectContextRef obc;
+  hobject_t soid(m->get_oid(),
+		 m->get_object_locator().key,
+		 m->get_snapid(),
+		 m->get_pg().ps(),
+		 m->get_object_locator().get_pool(),
+		 m->get_object_locator().nspace);
+  obc = get_object_context(soid, false);
+  assert(obc);
+
+  if (cursor >= dedup_offset + dedup_length) {
+    assert(0);
+  }
+
+  for (; cursor < dedup_offset + dedup_length; ) {
+    string oid_fp;
+    dedup_index = get_dedup_index(cursor);
+    if (obc->obs.oi.deduped_info.find(dedup_index) != obc->obs.oi.deduped_info.end()) {
+      oid_fp = obc->obs.oi.deduped_info[dedup_index].oid_fp;
+    }
+
+    dout(20) << __func__ << " oid: " << oid << " oid_fp: " << oid_fp << " remain: " << remain 
+	    << " cursor: " << cursor << " dedup index: " << dedup_index 
+	    << " dedup_offset: " << dedup_offset << " dedup_length: " << dedup_length 
+	    << " d_chunk_size: " << d_chunk_size << dendl;
+
+    if (oid_fp.empty() || (!(offset % d_chunk_size) && !(length % d_chunk_size))) {
+      bufferptr tmp_buf(d_chunk_size);
+      tmp_buf.zero();
+      bufferlist write_buf;
+      write_buf.append(tmp_buf);
+      /* fix me */
+      if (length > d_chunk_size * 2) {
+	do_dedup_overwrite(op, write_buf, cursor, d_chunk_size, false);
+      } else {
+	do_dedup_overwrite(op, write_buf, cursor, d_chunk_size, true);
+      }
+    } else {
+      ObjectOperation *o_op = new ObjectOperation;
+      assert(o_op);
+      addop_dedup_read(o_op, 0, d_chunk_size);
+      do_dedup_full_read_and_write(oid_fp, op, o_op, cursor, d_chunk_size);
+    }
+    cursor += d_chunk_size;
+  }
+}
+
+void ReplicatedPG::do_dedup_overwrite(OpRequestRef op, bufferlist & write_buf,
+				       uint64_t real_offset, uint64_t real_length, bool need_chk_ref)
+{
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  assert(m);
+  bufferlist list;
+  /* find original write ops */
+  int w_index = -1;
+  uint64_t d_chunk_size = get_pool().dedup_chunk_size;
+  string oid_fp;
+  w_index = find_ops_index(m->ops, CEPH_OSD_OP_WRITE);
+  assert(w_index != -1);
+
+  ChunknFPRef cnf(std::make_shared<ChunknFP>(FIXED_CHUNK, d_chunk_size, FP_SHA1));
+  uint64_t t_offset = 0, t_length = 0, s_offset = 0;
+  uint64_t ori_offset = m->ops[w_index].op.extent.offset;
+  uint64_t ori_length = m->ops[w_index].op.extent.length;
+
+  get_dedup_offset(ori_offset, ori_length, real_offset, real_length,
+		    t_offset, t_length, s_offset);
+
+
+  write_buf.copy_in(t_offset, t_length, m->ops[w_index].indata.c_str() + s_offset);
+  cnf->do_cnf(write_buf);
+  oid_fp = cnf->get_fp_to_string(0);
+
+  dout(20) << __func__ << " " << __LINE__ << " ori_offset: " << ori_offset 
+	  << " ori_length: " << ori_length << " t_offset: " << t_offset << " t_length: "
+	  << t_length << " s_offset: " << s_offset  << " real_offset: " << real_offset
+	  << " real_length: " << real_length << dendl;
+  
+  /* We can avoid overwirte the data which is the same as previous written */
+  string prev_fp;
+  hobject_t soid(m->get_oid(),
+		 m->get_object_locator().key,
+		 m->get_snapid(),
+		 m->get_pg().ps(),
+		 m->get_object_locator().get_pool(),
+		 m->get_object_locator().nspace);
+  search_fp(soid, real_offset, prev_fp);
+  /* test code !!! */
+  //oid_fp = soid.oid.name;
+  
+  if (oid_fp == prev_fp) {
+    if (m->wants_ondisk()) {
+      send_op_reply(soid, op);
+    } 
+    return;
+  }
+
+  if (need_chk_ref) {
+    ObjectOperation obj_op;
+    bufferlist tmp_list;
+    ::encode(soid.oid, tmp_list);
+    addop_dedup_xattr(&obj_op, CHECK_INC_REFERENCE_OID, list);
+    object_locator_t oloc(m->get_object_locator());
+    oloc.pool = pool.info.cas_pool;
+    SnapContext snapc(m->get_snap_seq(), m->get_snaps());
+    object_t oid(oid_fp);
+    unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | CEPH_OSD_FLAG_RWORDERED
+		      | CEPH_OSD_FLAG_DEDUPE_WRITE;
+
+    C_DedupChkRef *fin = new C_DedupChkRef(this, op, soid, get_last_peering_reset());
+    fin->oid_fp = oid_fp;
+    fin->write_buf.claim_append(write_buf);
+    fin->real_offset = real_offset;
+    fin->real_length = real_length;
+
+    osd->objecter->setdedupxattr(oid, oloc, &obj_op, snapc, 
+				      ceph::real_clock::from_ceph_timespec(m->get_mtime()),
+				      flags,
+				      NULL, new C_OnFinisher(fin, &osd->objecter_finisher));
+  } else {
+    ObjectOperation * obj_op = new ObjectOperation;
+    assert(obj_op);
+    addop_dedup_write(obj_op, write_buf);
+    do_dedup_write(oid_fp, op, NULL, obj_op, real_offset, real_length);
+    write_buf.clear();
+  } 
+
+  dout(20) << __func__ << " " << __LINE__ << " oid_fp: " << oid_fp << " extent.offset: " 
+	  << m->ops[w_index].op.extent.offset 
+	  << " extent.length: " << m->ops[w_index].op.extent.length << " data length: " 
+	  << m->ops[w_index].indata.length() 
+	  //<< " outdata length: " << osd_op.outdata.length() <<  " indata length: " << osd_op.indata.length() 
+	  << " write buf size: " << write_buf.length() << " real_offset: " << real_offset 
+	  << " real_length: " << real_length
+	  << dendl;
+}
+
+void ReplicatedPG::send_op_reply(hobject_t soid, OpRequestRef op)
+{
+  ObjectContextRef obc;
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  obc = get_object_context(soid, false);
+  assert(obc);
+  assert(m);
+  MOSDOpReply *reply = new MOSDOpReply(m, 0, get_osdmap()->get_epoch(), 0, true);
+  reply->set_reply_versions(eversion_t(), obc->obs.oi.user_version);
+  reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
+  dout(20) << __func__ <<  " sending commit on " << op << " " << reply << dendl;
+  osd->send_message_osd_client(reply, m->get_connection());
+  op->mark_commit_sent();
+}
+
+void ReplicatedPG::get_dedup_attr(string oid_fp, OpRequestRef op, int next, bool cas) 
+{
+  object_t oid(oid_fp);
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  object_locator_t oloc(m->get_object_locator());
+  if (cas) {
+    oloc.pool = pool.info.cas_pool;
+  } else {
+    oloc.pool = pool.info.tier_of;
+  }
+  assert(oloc.pool != -1);
+
+  // RWORDERED !
+  unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY;
+  flags |= m->get_flags() & (CEPH_OSD_FLAG_RWORDERED | CEPH_OSD_FLAG_DEDUPE_READ);
+
+  snapid_t snapt  = m->get_snapid();
+
+  hobject_t soid(m->get_oid(),
+		 m->get_object_locator().key,
+		 snapt,
+		 m->get_pg().ps(),
+		 m->get_object_locator().get_pool(),
+		 m->get_object_locator().nspace);
+  ProxyReadOpRef prdop(std::make_shared<ProxyReadOp>(op, soid, m->ops));
+  C_DedupGetAttrs * fin = new C_DedupGetAttrs;
+  fin->op = op;
+  fin->next_op = next;
+  fin->pg = this;
+  fin->oid_fp = oid_fp;
+  fin->soid = soid; 
+
+  dout(15) << __func__ << " " << __LINE__ << " fp oid: " << oid_fp 
+	  << " ori oid: " << m->get_oid() << dendl;
+
+  ceph_tid_t tid = osd->objecter->getxattrs(oid, oloc, CEPH_NOSNAP, fin->attrset,  
+				flags, fin);
+  fin->tid = tid;
+  prdop->objecter_tid = tid;
+  proxyread_ops[tid] = prdop;
+  in_progress_proxy_ops[soid].push_back(op);
+
+}
+
+void ReplicatedPG::set_dedup_attr(string oid_fp, OpRequestRef op,  
+				    ObjectOperation * o_op, bool cas) 
+{
+  object_t oid(oid_fp);
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  assert(m);
+  object_locator_t oloc(m->get_object_locator());
+  if (cas) {
+    oloc.pool = pool.info.cas_pool;
+  } else {
+    oloc.pool = pool.info.tier_of;
+  }
+  SnapContext snapc(m->get_snap_seq(), m->get_snaps());
+  // RWORDERED !
+  unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | CEPH_OSD_FLAG_RWORDERED
+		    | CEPH_OSD_FLAG_DEDUPE_WRITE;
+  bufferlist list;
+  string ori_oid = m->get_oid().name;
+  snapid_t snapt = m->get_snapid();
+
+  hobject_t soid(m->get_oid(),
+		 m->get_object_locator().key,
+		 snapt,
+		 m->get_pg().ps(),
+		 m->get_object_locator().get_pool(),
+		 m->get_object_locator().nspace);
+
+  ProxyWriteOpRef pwop(std::make_shared<ProxyWriteOp>(op, soid, m->ops, m->get_reqid()));
+  pwop->ctx = new OpContext(op, m->get_reqid(), pwop->ops, this);
+  pwop->mtime = m->get_mtime();
+  pwop->oid_fp = oid;
+
+  C_DedupSetXattr_Commit *fin = new C_DedupSetXattr_Commit(
+      this, soid, get_last_peering_reset(), pwop);
+
+  ceph_tid_t tid = osd->objecter->setdedupxattr(oid, oloc, o_op, snapc, 
+					      ceph::real_clock::from_ceph_timespec(pwop->mtime),
+					      flags,
+					      NULL, new C_OnFinisher(fin, &osd->objecter_finisher));
+  fin->tid = tid;
+  pwop->objecter_tid = tid;
+  proxywrite_ops[tid] = pwop;
+  in_progress_proxy_ops[soid].push_back(op);
+
+  dout(15) << __func__ << " " << __LINE__ << " fp oid: " << oid_fp << " ori oid: " 
+	  << m->get_oid() << " tid: " << tid << dendl;
+
+}
+
+ceph_tid_t ReplicatedPG::do_dedup_write(string oid_fp, OpRequestRef op, hobject_t * missing_oid, 
+					ObjectOperation * o_op, uint64_t real_offset, uint64_t real_length) 
+{
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  object_locator_t oloc(m->get_object_locator());
+  oloc.pool = pool.info.tier_of;
+  SnapContext snapc(m->get_snap_seq(), m->get_snaps());
+  object_t oid(oid_fp);
+  snapid_t snapt;
+  assert(o_op);
+  assert(o_op->ops.size());
+
+  if (missing_oid) {
+    snapt = missing_oid->snap;
+  } else {
+    snapt = m->get_snapid();
+  }
+
+  hobject_t soid(m->get_oid(),
+		 m->get_object_locator().key,
+		 snapt,
+		 m->get_pg().ps(),
+		 m->get_object_locator().get_pool(),
+		 m->get_object_locator().nspace);
+  object_locator_t cas_oloc(soid);
+  cas_oloc.pool = get_pool().cas_pool;
+  assert(cas_oloc.pool != -1);
+
+  unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | CEPH_OSD_FLAG_RWORDERED
+		    | CEPH_OSD_FLAG_DEDUPE_WRITE;
+
+  ProxyWriteOpRef pwop(std::make_shared<ProxyWriteOp>(op, soid, m->ops, m->get_reqid()));
+  pwop->ctx = new OpContext(op, m->get_reqid(), pwop->ops, this);
+  pwop->mtime = m->get_mtime();
+  pwop->oid_fp = oid;
+
+  /* obj_op will be deleted... */
+  ObjectOperation obj_op;
+  obj_op.dup(o_op->ops);
+
+  C_DedupWrite_Commit *fin = new C_DedupWrite_Commit(
+      this, soid, get_last_peering_reset(), pwop);
+  fin->oid_fp = oid_fp;
+  fin->real_offset = real_offset;
+  fin->real_length = real_length;
+
+  C_GatherBuilder gather(g_ceph_context);
+  gather.set_finisher(new C_OnFinisher(fin,
+				       &osd->objecter_finisher));
+
+  ceph_tid_t tid;
+  tid = osd->objecter->mutate(
+    oid, cas_oloc, obj_op, snapc,
+    ceph::real_clock::from_ceph_timespec(pwop->mtime),
+    flags, NULL, gather.new_sub(),
+    &pwop->user_version, pwop->reqid);
+
+  fin->tid = tid;
+  pwop->objecter_tid = tid;
+  proxywrite_ops[tid] = pwop;
+  in_progress_proxy_ops[soid].push_back(op);
+
+  /* update metadata */
+#if 0
+  dedup_set_meta_info(soid, oid, gather.new_sub(), snapc,
+		      ceph::real_clock::from_ceph_timespec(pwop->mtime),
+		      real_offset);
+#endif
+
+  dout(20) << __func__ << " " << __LINE__ << " fp oid: " << oid_fp 
+	  << " ori oid: " << m->get_oid() << " tid: " << tid 
+	  << dendl;
+  gather.activate();
+  return tid;
+}
+
+bool ReplicatedPG::do_dedup_read(string oid_fp, OpRequestRef op, ObjectOperation *o_op, 
+				  uint64_t real_offset, uint64_t real_length) 
+{
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  object_locator_t oloc(m->get_object_locator());
+  oloc.pool = get_pool().cas_pool;
+  object_t oid(oid_fp);
+
+  hobject_t soid(m->get_oid(),
+		 m->get_object_locator().key,
+		 m->get_snapid(),
+		 m->get_pg().ps(),
+		 m->get_object_locator().get_pool(),
+		 m->get_object_locator().nspace);
+  assert(oloc.pool != -1);
+
+  unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY;
+
+  dout(15) << __func__ << " " << __LINE__ << " fp oid: " << oid_fp 
+	  << " ori oid: " << m->get_oid() << dendl;
+
+  flags |= m->get_flags() & (CEPH_OSD_FLAG_RWORDERED | CEPH_OSD_FLAG_DEDUPE_READ);
+
+  ProxyReadOpRef prdop(std::make_shared<ProxyReadOp>(op, soid, m->ops));
+
+  C_DedupRead *fin = new C_DedupRead(this, soid, get_last_peering_reset(),
+				     prdop);
+  fin->o_op = o_op;
+  fin->real_offset = real_offset;
+  fin->real_length = real_length;
+  fin->oid_fp = oid_fp;
+
+  ObjectOperation obj_op;
+  obj_op.dup(o_op->ops);
+
+  ceph_tid_t tid = osd->objecter->read(
+    oid, oloc, obj_op,
+    m->get_snapid(), NULL,
+    flags, new C_OnFinisher(fin, &osd->objecter_finisher),
+    &prdop->user_version,
+    &prdop->data_offset,
+    m->get_features());
+  fin->tid = tid;
+  prdop->objecter_tid = tid;
+  proxyread_ops[tid] = prdop;
+  in_progress_proxy_ops[soid].push_back(op);
+
+  dout(15) << __func__ << " " << __LINE__ << " fp oid: " << oid_fp 
+	  << " ori oid: " << m->get_oid() << " tid: " << tid << dendl;
+
+  return true;
+}
+
+bool ReplicatedPG::do_dedup_full_read_and_write(string oid_fp, OpRequestRef op, ObjectOperation *o_op,
+						  uint64_t real_offset, uint64_t real_length) 
+{
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  object_locator_t oloc(m->get_object_locator());
+  oloc.pool = get_pool().cas_pool;
+  object_t oid(oid_fp);
+
+  hobject_t soid(m->get_oid(),
+		 m->get_object_locator().key,
+		 m->get_snapid(),
+		 m->get_pg().ps(),
+		 m->get_object_locator().get_pool(),
+		 m->get_object_locator().nspace);
+  assert(oloc.pool != -1);
+
+  unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY;
+
+  flags |= m->get_flags() & (CEPH_OSD_FLAG_RWORDERED | CEPH_OSD_FLAG_DEDUPE_READ);
+
+  ProxyReadOpRef prdop(std::make_shared<ProxyReadOp>(op, soid, m->ops));
+
+  C_DedupRead *fin = new C_DedupRead(this, soid, get_last_peering_reset(),
+				     prdop);
+  fin->real_offset = real_offset;
+  fin->real_length = real_length;
+  fin->o_op = o_op;
+  fin->oid_fp = oid_fp;
+  fin->next_op = DEDUPE_OVERWRITE;
+
+  ObjectOperation obj_op;
+  obj_op.dup(o_op->ops);
+
+  ceph_tid_t tid = osd->objecter->read(
+    oid, oloc, obj_op,
+    m->get_snapid(), NULL,
+    flags, new C_OnFinisher(fin, &osd->objecter_finisher),
+    &prdop->user_version,
+    &prdop->data_offset,
+    m->get_features());
+
+  fin->tid = tid;
+
+  prdop->objecter_tid = tid;
+  proxyread_ops[tid] = prdop;
+  in_progress_proxy_ops[soid].push_back(op);
+
+  dout(15) << __func__ << " " << __LINE__ << " fp oid: " << oid_fp 
+	  << " ori oid: " << m->get_oid() << " tid: " << tid << " ops size: " 
+	  << o_op->ops.size() << dendl;
+
+  return true;
+}
+
+bool ReplicatedPG::search_fp(hobject_t soid, uint64_t offset, string &fp) {
+  ObjectContextRef obc;
+  obc = get_object_context(soid, false);
+  if (!obc) {
+    dout(20) << __func__ << " can not find obc " << dendl;
+    return false;
+  }
+  int dedup_index = get_dedup_index(offset);
+  if (obc->obs.oi.deduped_info.find(dedup_index) != obc->obs.oi.deduped_info.end()) {
+    fp = obc->obs.oi.deduped_info[dedup_index].oid_fp;
+  } else {
+    return false;
+  } 
+  return true;
+}
+
+void ReplicatedPG::kick_blocked_dedup_ops(hobject_t& soid)
+{
+  map<hobject_t, list<OpRequestRef>, hobject_t::BitwiseComparator>::iterator p = blocked_dedup_ops.find(soid);
+  if (p == blocked_dedup_ops.end())
+    return;
+  list<OpRequestRef>& ls = p->second;
+  dout(15) << __func__ << " " << soid << " requeuing " << ls.size() << " requests" << dendl;
+  requeue_ops(ls);
+  blocked_dedup_ops.erase(p);
+}
+
+
+bool ReplicatedPG::update_dedup_obj_meta(hobject_t soid, OpRequestRef op, string oid_fp, SnapContext &snapc,
+					  uint64_t real_offset, uint64_t real_length, bool sync)
+{
+  uint64_t offset;
+  uint64_t d_chunk_size = get_pool().dedup_chunk_size;
+  string prev_oid_fp;
+  ObjectContextRef obc;
+  obc = get_object_context(soid, false);
+  assert(obc);
+  offset = get_dedup_index(real_offset);
+  if (obc->obs.oi.deduped_info.find(offset) != obc->obs.oi.deduped_info.end()) {
+    prev_oid_fp = obc->obs.oi.deduped_info[offset].oid_fp;
+  }
+  if (!prev_oid_fp.empty()) {
+    /* Do we need synchorous I/O ? */
+    object_t oid(prev_oid_fp);
+    if (sync) {
+      ObjectOperation obj_op;
+      bufferlist list;
+      ::encode(oid, list);
+      addop_dedup_xattr(&obj_op, DEREFERENCE_OID, list);
+      set_dedup_attr(prev_oid_fp, op, &obj_op, true);
+    } else {
+      MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+      assert(m);
+      dedup_dec_ref(soid, oid, NULL, snapc,
+		    ceph::real_clock::from_ceph_timespec(m->get_mtime()));
+    }
+  }
+  /* We already sent sexattr in order to update dedup meta data */
+  if (!obc->obs.oi.test_flag(object_info_t::FLAG_DEDUPED)) {
+    obc->obs.oi.set_flag(object_info_t::FLAG_DEDUPED);
+  }
+  dedup_chunk_info_t d_chk_info(d_chunk_size, oid_fp, get_pool().cas_pool, C_CLEAN);
+  obc->obs.oi.deduped_info[offset] = d_chk_info;
+
+  dout(20) << __func__ << " oid: " << oid_fp << " offset: " << offset << " chunk size: " 
+	  << d_chunk_size << " cas_pool: " << get_pool().cas_pool << dendl;
+
+  return true;
+}
+
+void ReplicatedPG::update_dedup_obj_meta_sync(hobject_t soid)
+{
+  ObjectContextRef obc;
+  obc = get_object_context(soid, false);
+  assert(obc);
+
+  // store deduped info
+  OpContextUPtr ctx = simple_opc_create(obc);
+  bufferlist bl;
+  ::encode(obc->obs.oi, bl);
+  PGBackend::PGTransaction *t = ctx->op_t.get();
+  setattr_maybe_cache(obc, ctx.get(), t, OI_ATTR, bl);
+  simple_opc_submit(std::move(ctx));
+}
+
+uint64_t ReplicatedPG::get_dedup_index(uint64_t off)
+{
+  uint64_t d_chunk_size = get_pool().dedup_chunk_size;
+  uint64_t remain = 0, chunk_offset = 0;
+  if (off % d_chunk_size == 0) {
+    remain = 0;
+  } else {
+    remain = off % d_chunk_size; 
+  }
+  chunk_offset = off;
+  chunk_offset -= remain;
+  return chunk_offset/d_chunk_size;
+}
+
+/*
+ * ori_* : requested offset, length
+ * real_* : dedup offset, length (chunk boundary)
+ * d_offset : destination offset (chunk length buffer)
+ * d_length : destination length
+ * s_offset : source offset
+ *
+ */
+void ReplicatedPG::get_dedup_offset(uint64_t ori_offset, uint64_t ori_length, 
+				    uint64_t real_offset, uint64_t real_length,
+				    uint64_t &d_offset, uint64_t &d_length,
+				    uint64_t &s_offset)
+{
+  d_offset = 0;
+  d_length = 0;
+  s_offset = 0;
+
+  if (ori_offset > real_offset) {
+    d_offset = ori_offset - real_offset;
+  } 
+  /* | aligned data | or chunk size is less than length */
+  d_length = real_length;
+  /* | partial data | padding | */
+  if (ori_offset <= real_offset) {
+    if (real_offset + real_length > ori_offset + ori_length) {
+      d_length = (ori_offset + ori_length) - real_offset;
+      /* | padding | partial data | padding | */
+      if (d_offset > 0) {
+	d_length = d_length - d_offset;
+      }
+    }
+  /* | padding | partial data | */
+  } else if (ori_offset > real_offset) {
+    /* | padding | partial data | or | padding | partial data | padding | */
+    if (real_offset + real_length < (ori_offset + real_length)) {
+      d_length = ori_length;
+      /* | padding | partial data | partial data --> | padding | partial data | */
+      if (d_offset + d_length > real_length) {
+	d_length = real_length - d_offset;
+      }
+    } 
+  } 
+  if (real_offset > ori_offset) {
+    s_offset = real_offset - ori_offset;
+  } 
+}
+
+bool ReplicatedPG::get_op_rw_offset(OpRequestRef op, uint64_t &offset)
+{
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  if (!m || !m->ops.size()) {
+    return false;
+  }
+
+  dout(20) << __func__ << " " << __LINE__ << " enter! " 
+	  << " length: " << m->get_data_len() << " type: " << m->get_type() << dendl;
+
+  for (vector<OSDOp>::iterator p = m->ops.begin(); p != m->ops.end(); ++p) {
+    OSDOp& osd_op = *p;
+    ceph_osd_op& ceph_op = osd_op.op;
+    //dout(20) << " ceph op: " << ceph_op.op << dendl;
+    switch (ceph_op.op) {
+      case CEPH_OSD_OP_READ: 
+      case CEPH_OSD_OP_WRITE:
+	dout(20) << "offset: " << ceph_op.extent.offset << " length: " 
+		<< ceph_op.extent.length << dendl; 
+	offset = ceph_op.extent.offset;
+	return true;
+    }
+  }
+  return false;
+}
+
+bool ReplicatedPG::get_op_rw_length(OpRequestRef op, uint64_t &length)
+{
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  if (!m || !m->ops.size()) {
+    return false;
+  }
+
+  dout(20) << __func__ << " " << __LINE__ << " enter! " 
+	  << " length: " << m->get_data_len() << " type: " << m->get_type() << dendl;
+
+  for (vector<OSDOp>::iterator p = m->ops.begin(); p != m->ops.end(); ++p) {
+    OSDOp& osd_op = *p;
+    ceph_osd_op& ceph_op = osd_op.op;
+    //dout(20) << " ceph op: " << ceph_op.op << dendl;
+    switch (ceph_op.op) {
+      case CEPH_OSD_OP_READ: 
+      case CEPH_OSD_OP_WRITE:
+	dout(20) << "length: " << ceph_op.extent.length<< " length: " 
+		<< ceph_op.extent.length << dendl; 
+	length = ceph_op.extent.length;
+	return true;
+    }
+  }
+  return false;
+}
+
 ReplicatedPG::cache_result_t ReplicatedPG::maybe_handle_cache_detail(
   OpRequestRef op,
   bool write_ordered,
@@ -2199,7 +3376,14 @@ ReplicatedPG::cache_result_t ReplicatedPG::maybe_handle_cache_detail(
 
   if (obc.get() && obc->obs.exists) {
     osd->logger->inc(l_osd_op_cache_hit);
-    return cache_result_t::NOOP;
+    // modified by omw
+    //dout(0) << __func__ << " cache hit " << dendl;
+    // Fix me !
+    //if (!obc->obs.oi.promoted_only_meta || !is_target_op(op) ||
+    if (!is_target_op(op) ||
+	pool.info.cache_mode != pg_pool_t::CACHEMODE_PROXY || !get_pool().enable_dedup) {
+      return cache_result_t::NOOP;
+    }
   }
 
   if (missing_oid == hobject_t() && obc.get()) {
@@ -2225,6 +3409,10 @@ ReplicatedPG::cache_result_t ReplicatedPG::maybe_handle_cache_detail(
       if (!op->may_write() && !op->may_cache() &&
 	  !write_ordered && !must_promote) {
 	dout(20) << __func__ << " cache pool full, proxying read" << dendl;
+	// modified by omw
+	if (get_pool().enable_dedup && is_target_op(op)) {
+	  return do_dedup_r(op); 
+	}
 	do_proxy_read(op);
 	return cache_result_t::HANDLED_PROXY;
       }
@@ -2240,6 +3428,10 @@ ReplicatedPG::cache_result_t ReplicatedPG::maybe_handle_cache_detail(
 
     if (op->may_write() || op->may_cache()) {
       if (can_proxy_write) {
+	// modified by omw
+	if (get_pool().enable_dedup && is_target_op(op)) {
+	  return do_dedup_w(op, missing_oid); 
+	}
         do_proxy_write(op, missing_oid);
       } else {
 	// promote if can't proxy the write
@@ -2278,6 +3470,11 @@ ReplicatedPG::cache_result_t ReplicatedPG::maybe_handle_cache_detail(
                                  pool.info.min_read_recency_for_promote,
                                  promote_op, promote_obc);
       }
+
+      // modified by omw
+      /* we don't expect here yet */
+      assert(0);
+
       if (!promoted && !did_proxy_read) {
 	// redirect the op if it's not proxied and not promoting
 	do_cache_redirect(op);
@@ -2332,10 +3529,16 @@ ReplicatedPG::cache_result_t ReplicatedPG::maybe_handle_cache_detail(
     if (!must_promote) {
       if (op->may_write() || op->may_cache() || write_ordered) {
 	if (can_proxy_write) {
+	  if (get_pool().enable_dedup && is_target_op(op)) {
+	    return do_dedup_w(op, missing_oid); 
+	  }
 	  do_proxy_write(op, missing_oid);
 	  return cache_result_t::HANDLED_PROXY;
 	}
       } else {
+	if (get_pool().enable_dedup && is_target_op(op)) {
+	  return do_dedup_r(op); 
+	}
 	do_proxy_read(op);
 	return cache_result_t::HANDLED_PROXY;
       }
@@ -2569,9 +3772,72 @@ void ReplicatedPG::finish_proxy_read(hobject_t oid, ceph_tid_t tid, int r)
   q->second.erase(it);
   if (q->second.size() == 0) {
     in_progress_proxy_ops.erase(oid);
+    // for dedup
+    kick_blocked_dedup_ops(oid);
   }
 
   osd->logger->inc(l_osd_tier_proxy_read);
+
+  MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
+  OpContext *ctx = new OpContext(op, m->get_reqid(), prdop->ops, this);
+  ctx->reply = new MOSDOpReply(m, 0, get_osdmap()->get_epoch(), 0, false);
+  ctx->user_at_version = prdop->user_version;
+  ctx->data_off = prdop->data_offset;
+  ctx->ignore_log_op_stats = true;
+  complete_read_ctx(r, ctx);
+}
+
+// modified by omw
+void ReplicatedPG::finish_dedup_proxy_read(hobject_t oid, ceph_tid_t tid, int r)
+{
+  dout(10) << __func__ << " " << oid << " tid " << tid
+	   << " " << cpp_strerror(r) << dendl;
+
+  map<ceph_tid_t, ProxyReadOpRef>::iterator p = proxyread_ops.find(tid);
+  if (p == proxyread_ops.end()) {
+    dout(10) << __func__ << " no dedup_proxyread_op found" << dendl;
+    return;
+  }
+  ProxyReadOpRef prdop = p->second;
+  if (tid != prdop->objecter_tid) {
+    dout(10) << __func__ << " tid " << tid << " != prdop " << prdop
+	     << " tid " << prdop->objecter_tid << dendl;
+    return;
+  }
+  if (oid != prdop->soid) {
+    dout(10) << __func__ << " oid " << oid << " != prdop " << prdop
+	     << " soid " << prdop->soid << dendl;
+    return;
+  }
+  proxyread_ops.erase(tid);
+
+  map<hobject_t, list<OpRequestRef>, hobject_t::BitwiseComparator>::iterator q = in_progress_proxy_ops.find(oid);
+  if (q == in_progress_proxy_ops.end()) {
+    dout(10) << __func__ << " no in_progress_proxy_ops found" << dendl;
+    return;
+  }
+  assert(q->second.size());
+  list<OpRequestRef>::iterator it = std::find(q->second.begin(),
+                                              q->second.end(),
+					      prdop->op);
+  assert(it != q->second.end());
+  OpRequestRef op = *it;
+  q->second.erase(it);
+
+  if (q->second.size() == 0) {
+    in_progress_proxy_ops.erase(oid);
+    // for dedup
+    kick_blocked_dedup_ops(oid);
+  } else if (std::find(q->second.begin(),
+                       q->second.end(),
+                       prdop->op) != q->second.end()) {
+    /* multiple read case */
+    dout(20) << __func__ << " " << oid << " is not completed  " << dendl;
+    return;
+  }
+
+  osd->logger->inc(l_osd_tier_proxy_read);
+
 
   MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
   OpContext *ctx = new OpContext(op, m->get_reqid(), prdop->ops, this);
@@ -2667,6 +3933,7 @@ struct C_ProxyWrite_Commit : public Context {
   }
 };
 
+
 void ReplicatedPG::do_proxy_write(OpRequestRef op, const hobject_t& missing_oid)
 {
   MOSDOp *m = static_cast<MOSDOp*>(op->get_req());
@@ -2735,6 +4002,8 @@ void ReplicatedPG::finish_proxy_write(hobject_t oid, ceph_tid_t tid, int r)
   in_progress_op.erase(it);
   if (in_progress_op.size() == 0) {
     in_progress_proxy_ops.erase(oid);
+    // for dedup
+    kick_blocked_dedup_ops(oid);
   }
 
   osd->logger->inc(l_osd_tier_proxy_write);
@@ -2773,6 +4042,97 @@ void ReplicatedPG::finish_proxy_write(hobject_t oid, ceph_tid_t tid, int r)
 
   delete pwop->ctx;
   pwop->ctx = NULL;
+}
+
+// modified by omw
+void ReplicatedPG::finish_dedup_proxy_write(hobject_t oid, ceph_tid_t tid, int r)
+{
+  dout(10) << __func__ << " " << oid << " tid " << tid
+	   << " " << cpp_strerror(r) << dendl;
+
+  map<ceph_tid_t, ProxyWriteOpRef>::iterator p = proxywrite_ops.find(tid);
+  if (p == proxywrite_ops.end()) {
+    dout(10) << __func__ << " no proxywrite_op found" << dendl;
+    return;
+  }
+  ProxyWriteOpRef pwop = p->second;
+  assert(tid == pwop->objecter_tid);
+  assert(oid == pwop->soid);
+
+  proxywrite_ops.erase(tid);
+
+  map<hobject_t, list<OpRequestRef> >::iterator q = in_progress_proxy_ops.find(oid);
+  if (q == in_progress_proxy_ops.end()) {
+    dout(10) << __func__ << " no in_progress_proxy_ops found" << dendl;
+    delete pwop->ctx;
+    pwop->ctx = NULL;
+    return;
+  }
+  list<OpRequestRef>& in_progress_op = q->second;
+  assert(in_progress_op.size());
+  list<OpRequestRef>::iterator it = std::find(in_progress_op.begin(),
+                                              in_progress_op.end(),
+					      pwop->op);
+  assert(it != in_progress_op.end());
+  in_progress_op.erase(it);
+
+  if (in_progress_op.size() == 0) {
+    in_progress_proxy_ops.erase(oid);
+    kick_blocked_dedup_ops(oid);
+  } else if (std::find(in_progress_op.begin(),
+			in_progress_op.end(),
+			pwop->op) != in_progress_op.end()) {
+    /* modified by omw */
+    /* We will handle remain I/O/s before returning ack */
+    if (pwop->ctx)
+      delete pwop->ctx;
+    pwop->ctx = NULL;
+    dout(20) << __func__ << " " << oid << " tid " << tid
+	    << " in_progress_op size: " 
+	    << in_progress_op.size() << dendl;
+    return;
+  }
+
+  assert(pwop->op);
+
+  osd->logger->inc(l_osd_tier_proxy_write);
+
+  MOSDOp *m = static_cast<MOSDOp*>(pwop->op->get_req());
+  assert(m != NULL);
+
+  if (m->wants_ondisk() && !pwop->sent_disk) {
+    // send commit.
+    MOSDOpReply *reply = pwop->ctx->reply;
+    if (reply)
+      pwop->ctx->reply = NULL;
+    else {
+      reply = new MOSDOpReply(m, r, get_osdmap()->get_epoch(), 0, true);
+      reply->set_reply_versions(eversion_t(), pwop->user_version);
+    }
+    reply->add_flags(CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK);
+    dout(10) << " sending commit on " << pwop << " " << reply << dendl;
+    osd->send_message_osd_client(reply, m->get_connection());
+    pwop->sent_disk = true;
+    pwop->ctx->op->mark_commit_sent();
+  } else if (m->wants_ack() && !pwop->sent_ack && !pwop->sent_disk) {
+    // send ack
+    MOSDOpReply *reply = pwop->ctx->reply;
+    if (reply)
+      pwop->ctx->reply = NULL;
+    else {
+      reply = new MOSDOpReply(m, r, get_osdmap()->get_epoch(), 0, true);
+      reply->set_reply_versions(eversion_t(), pwop->user_version);
+    }
+    reply->add_flags(CEPH_OSD_FLAG_ACK);
+    dout(10) << " sending ack on " << pwop << " " << reply << dendl;
+    osd->send_message_osd_client(reply, m->get_connection());
+    pwop->sent_ack = true;
+  }
+
+  if (pwop->ctx)
+    delete pwop->ctx;
+  pwop->ctx = NULL;
+
 }
 
 void ReplicatedPG::cancel_proxy_write(ProxyWriteOpRef pwop)
@@ -2854,6 +4214,65 @@ void ReplicatedPG::promote_object(ObjectContextRef obc,
                    CEPH_OSD_COPY_FROM_FLAG_IGNORE_CACHE |
                    CEPH_OSD_COPY_FROM_FLAG_MAP_SNAP_CLONE |
                    CEPH_OSD_COPY_FROM_FLAG_RWORDERED;
+
+  start_copy(cb, obc, obc->obs.oi.soid, my_oloc, 0, flags,
+	     obc->obs.oi.soid.snap == CEPH_NOSNAP,
+	     src_fadvise_flags, 0);
+
+  assert(obc->is_blocked());
+
+  if (op)
+    wait_for_blocked_object(obc->obs.oi.soid, op);
+  info.stats.stats.sum.num_promote++;
+}
+
+// modified by omw
+void ReplicatedPG::promote_dedup_meta_object(ObjectContextRef obc,
+				  const hobject_t& missing_oid,
+				  const object_locator_t& oloc,
+				  OpRequestRef op)
+{
+  hobject_t hoid = obc ? obc->obs.oi.soid : missing_oid;
+  assert(hoid != hobject_t());
+  if (scrubber.write_blocked_by_scrub(hoid, get_sort_bitwise())) {
+    dout(10) << __func__ << " " << hoid
+	     << " blocked by scrub" << dendl;
+    if (op) {
+      waiting_for_active.push_back(op);
+      dout(10) << __func__ << " " << hoid
+	       << " placing op in waiting_for_active" << dendl;
+    } else {
+      dout(10) << __func__ << " " << hoid
+	       << " no op, dropping on the floor" << dendl;
+    }
+    return;
+  }
+  if (!obc) { // we need to create an ObjectContext
+    assert(missing_oid != hobject_t());
+    obc = get_object_context(missing_oid, true);
+  }
+
+  /*
+   * Before promote complete, if there are  proxy-reads for the object,
+   * for this case we don't use DONTNEED.
+   */
+  unsigned src_fadvise_flags = LIBRADOS_OP_FLAG_FADVISE_SEQUENTIAL;
+  map<hobject_t, list<OpRequestRef>, hobject_t::BitwiseComparator>::iterator q = in_progress_proxy_ops.find(obc->obs.oi.soid);
+  if (q == in_progress_proxy_ops.end()) {
+    src_fadvise_flags |= LIBRADOS_OP_FLAG_FADVISE_DONTNEED;
+  }
+
+  PromoteCallback *cb = new PromoteCallback(obc, this);
+  object_locator_t my_oloc = oloc;
+  my_oloc.pool = pool.info.tier_of;
+
+  unsigned flags = CEPH_OSD_COPY_FROM_FLAG_IGNORE_OVERLAY |
+                   CEPH_OSD_COPY_FROM_FLAG_IGNORE_CACHE |
+                   CEPH_OSD_COPY_FROM_FLAG_MAP_SNAP_CLONE |
+                   CEPH_OSD_COPY_FROM_FLAG_RWORDERED |
+		    CEPH_OSD_COPY_FROM_FLAG_DEDUPE_ONLY_META;
+
+  dout(20) << __func__ << " oid: " << hoid.oid.name << dendl;
   start_copy(cb, obc, obc->obs.oi.soid, my_oloc, 0, flags,
 	     obc->obs.oi.soid.snap == CEPH_NOSNAP,
 	     src_fadvise_flags, 0);
@@ -4114,7 +5533,8 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
     tracepoint(osd, do_osd_op_pre, soid.oid.name.c_str(), soid.snap.val, op.op, ceph_osd_op_name(op.op), op.flags);
 
     dout(10) << "do_osd_op  " << osd_op << dendl;
-
+    // modified by omw
+    bool for_dedup = false;
     bufferlist::iterator bp = osd_op.indata.begin();
 
     // user-visible modifcation?
@@ -4644,8 +6064,16 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  &out,
 	  true);
         
+	if (oi.test_flag(object_info_t::FLAG_DEDUPED)) {
+	  bufferlist list;
+	  ::encode(oi.deduped_info, list);
+	  out[DEDUPE_INFO] = list;
+	  //print_deduped_list(oi);
+	}
         bufferlist bl;
         ::encode(out, bl);
+	dout(0) << __func__ << " " << __LINE__ << " out length: " << out.size() 
+		<< " bl length: " << bl.length() << dendl;
 	ctx->delta_stats.num_rd_kb += SHIFT_ROUND_UP(bl.length(), 10);
         ctx->delta_stats.num_rd++;
         osd_op.outdata.claim_append(bl);
@@ -4945,6 +6373,12 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       ++ctx->num_write;
       { // write
         __u32 seq = oi.truncate_seq;
+	if (ctx->op) {
+	  MOSDOp *m = static_cast<MOSDOp*>(ctx->op->get_req());
+	  if (m->get_flags() & CEPH_OSD_FLAG_DEDUPE_WRITE) {
+	    for_dedup = true;
+	  }
+	}
 	tracepoint(osd, do_osd_op_pre_write, soid.oid.name.c_str(), soid.snap.val, oi.size, seq, op.extent.offset, op.extent.length, op.extent.truncate_size, op.extent.truncate_seq);
 	if (op.extent.length != osd_op.indata.length()) {
 	  result = -EINVAL;
@@ -5009,10 +6443,12 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	result = check_offset_and_length(op.extent.offset, op.extent.length, cct->_conf->osd_max_object_size);
 	if (result < 0)
 	  break;
-	if (pool.info.require_rollback()) {
-	  t->append(soid, op.extent.offset, op.extent.length, osd_op.indata, op.flags);
-	} else {
-	  t->write(soid, op.extent.offset, op.extent.length, osd_op.indata, op.flags);
+	if ((for_dedup && (get_ref_dedup(ctx->obc) < 0)) || !for_dedup)  {
+	  if (pool.info.require_rollback()) {
+	    t->append(soid, op.extent.offset, op.extent.length, osd_op.indata, op.flags);
+	  } else {
+	    t->write(soid, op.extent.offset, op.extent.length, osd_op.indata, op.flags);
+	  }
 	}
 
 	maybe_create_new_object(ctx);
@@ -5022,6 +6458,60 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  obs.oi.set_data_digest(osd_op.indata.crc32c(obs.oi.data_digest));
 	else
 	  obs.oi.clear_data_digest();
+	// modified by omw
+	if (for_dedup) {
+	  inc_ref_dedup(ctx->obc, t);
+	}
+	if (get_pool().enable_dedup && pool.info.cache_mode == pg_pool_t::CACHEMODE_WRITEBACK &&
+	    ctx->op && is_target_op(ctx->op)) {
+	  MOSDOp *m = static_cast<MOSDOp*>(ctx->op->get_req());
+	  assert(m);
+	  if (!(m->get_flags() & CEPH_OSD_FLAG_IGNORE_CACHE)) {
+	    uint64_t d_chunk_size = get_pool().dedup_chunk_size;
+	    string oid_fp;
+	    char d_chunk_state;
+	    uint64_t d_offset = 0;
+	    /* fix me */
+	    if (!(op.extent.offset % d_chunk_size) && !(op.extent.length % d_chunk_size)) {
+	      ChunknFPRef cnf(std::make_shared<ChunknFP>(FIXED_CHUNK, d_chunk_size, FP_SHA1, osd_op.indata));
+	      cnf->do_cnf();
+	      for (int i=0; i<cnf->get_entry_size(); i++) {
+		oid_fp = cnf->get_fp_to_string(i);
+		uint64_t offset = cnf->get_chunk_offset(i);
+		/* We can avoid overwirte the data which is the same as previous written */
+		string prev_fp;
+		search_fp(soid, op.extent.offset, prev_fp);
+		d_offset = get_dedup_index(op.extent.offset + offset);
+		/* Metadata is not updated yet in the case of C_PRE_CAL */
+		if (!prev_fp.empty() && oid_fp != prev_fp && 
+		    oi.deduped_info[d_offset].chk_state != C_PRE_CAL) {
+		  object_t oid(prev_fp);
+		  dedup_dec_ref(soid, oid, NULL, ctx->snapc,
+				ceph::real_clock::from_ceph_timespec(oi.mtime));
+		  dout(15) << __func__ << " send prev_oid_fp setxattr in order to reduce ref count " 
+			  << " prev_fp: " << prev_fp << " oid: " << oid_fp 
+			  << " offset: " << op.extent.offset << dendl;
+		} else {
+		  dout(15) << __func__ << " data is already stored (same fp) or never written" << " oid: " << oid_fp 
+			  << " offset: " << op.extent.offset << dendl;
+		}
+		d_chunk_state = C_PRE_CAL;
+		dedup_chunk_info_t d_chk_info(d_chunk_size, oid_fp, get_pool().cas_pool, d_chunk_state);
+		oi.deduped_info[d_offset] = d_chk_info;
+		dout(15) << __func__ << " d_offset: " << d_offset << " chk_state: " << d_chunk_state << dendl;
+	      }
+	    } else {
+	      uint64_t cursor = op.extent.offset;
+	      for (;cursor < op.extent.offset + op.extent.length; cursor+=d_chunk_size) {
+		d_offset = get_dedup_index(cursor);
+		d_chunk_state = C_MODIFIED;
+		dedup_chunk_info_t d_chk_info(d_chunk_size, oid_fp, get_pool().cas_pool, d_chunk_state);
+		oi.deduped_info[d_offset] = d_chk_info;
+		dout(15) << __func__ << " d_offset: " << d_offset << " chk_state: " << d_chunk_state << dendl;
+	      }
+	    }
+	  }
+	}
 	write_update_size_and_usage(ctx->delta_stats, oi, ctx->modified_ranges,
 				    op.extent.offset, op.extent.length, true);
 
@@ -5366,7 +6856,110 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       }
       break;
 
+      // -- debupe attrs --
+    /* fix me setxattr --> setxattrs */
+    case CEPH_OSD_OP_DEDUPE_SETXATTRS:
+      ++ctx->num_write;
+      {
+	if (cct->_conf->osd_max_attr_size > 0 &&
+	    op.xattr.value_len > cct->_conf->osd_max_attr_size) {
+	  tracepoint(osd, do_osd_op_pre_setxattr, soid.oid.name.c_str(), soid.snap.val, "???");
+	  result = -EFBIG;
+	  break;
+	}
+	/* fix me */
+	unsigned max_name_len = MIN(osd->store->get_max_attr_name_length(),
+				    cct->_conf->osd_max_attr_name_len);
+	if (op.xattr.name_len > max_name_len) {
+	  result = -ENAMETOOLONG;
+	  break;
+	}
+	string aname;
+	bp.copy(op.xattr.name_len, aname);
+	if (aname == DEREFERENCE_OID) {
+	  if (maybe_create_new_object(ctx)) {
+	    assert(0); 
+	  }
+	  result = dec_ref_dedup(ctx->obc, ctx, t);
+	} else if (aname == REFERENCE_OID) {
+	  if (maybe_create_new_object(ctx)) {
+	    assert(0); 
+	  }
+	  inc_ref_dedup(ctx->obc, t);
+	} else if (aname == CHECK_INC_REFERENCE_OID) {
+	  if (maybe_create_new_object(ctx)) {
+	    result = -ENOENT; 
+	  } else {
+	    inc_ref_dedup(ctx->obc, t);
+	  }
+	} else if (aname == DEDUPE_INFO) {
+	  bufferlist bl;
+	  bp.copy(op.xattr.value_len, bl);
+	  bufferlist::iterator oid_bp = bl.begin();
+	  ::decode(oi.deduped_info, oid_bp);
+	  dout(20) << __func__ << " " << __LINE__ << " SETXATTRS key: " << aname << dendl;
+	  //print_deduped_list(oi);
+	} else {
+	  string key_name, index_name;
+	  int key_name_len = strlen(DEDUPE_OFFSET); 	
+	  key_name = aname.substr(0, key_name_len);
+	  if (maybe_create_new_object(ctx)) {
+	    ctx->mod_desc.create();
+	    t->touch(soid);
+	  }
+	  if (key_name == DEDUPE_OFFSET) {
+	    index_name = aname.substr(key_name_len);
+	    int index = stoi(index_name);
+	    uint64_t d_chunk_size = get_pool().dedup_chunk_size;
+	    bufferlist bl;
+	    bp.copy(op.xattr.value_len, bl);
+	    object_t oid;
+	    bufferlist::iterator oid_bp = bl.begin();
+	    ::decode(oid, oid_bp);
+	    oi.set_flag(object_info_t::FLAG_DEDUPED);
+	    //oi.deduped_info[index] = oid.name;
+	    /* fix me: length can be changed via setxattr */
+	    dedup_chunk_info_t d_chk_info(d_chunk_size, oid.name, get_pool().cas_pool, C_CLEAN);
+	    oi.deduped_info[index] = d_chk_info;
+	    dout(20) << __func__ << " " << __LINE__ << " SETXATTRS key: " << key_name
+		    << " index: " << index_name << " value: " << oid.name << dendl;
+    
+	  } else {
+	    assert(0);
+	  }
+	}
+ 	ctx->delta_stats.num_wr++;
+      }
+      break;
 
+   /* fix me */
+   /* getattr from deduptable */
+   case CEPH_OSD_OP_DEDUPE_GETXATTRS:
+      ++ctx->num_read;
+      {
+	//tracepoint(osd, do_osd_op_pre_getxattrs, soid.oid.name.c_str(), soid.snap.val);
+	map<string, bufferlist> out;
+	result = getattrs_maybe_cache(
+	  ctx->obc,
+	  &out,
+	  true);
+        
+	if (oi.test_flag(object_info_t::FLAG_DEDUPED)) {
+	  bufferlist list;
+	  ::encode(oi.deduped_info, list);
+	  out[DEDUPE_INFO] = list;
+	  //print_deduped_list(ctx->obc->obs.oi);
+	  print_deduped_list(oi);
+	}
+        bufferlist bl;
+        ::encode(out, bl);
+	dout(0) << __func__ << " " << __LINE__ << " out length: " << out.size() 
+		<< " bl length: " << bl.length() << dendl;
+	ctx->delta_stats.num_rd_kb += SHIFT_ROUND_UP(bl.length(), 10);
+        ctx->delta_stats.num_rd++;
+        osd_op.outdata.claim_append(bl);
+      }
+      break;
       // -- object attrs --
       
     case CEPH_OSD_OP_SETXATTR:
@@ -5910,6 +7503,16 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 		   src_oloc.hash,
 		   src_snapid,
 		   src_version);
+
+	// modified by omw
+	if (op.copy_from.flags & CEPH_OSD_COPY_FROM_FLAG_DEDUPE_DOWNWARD) {
+	  if (!maybe_create_new_object(ctx)) {
+	    inc_ref_dedup(ctx->obc, t);
+	    result = 0;
+	    break;
+	  }
+	}
+
 	if (!ctx->copy_cb) {
 	  // start
 	  pg_t raw_pg;
@@ -6954,12 +8557,20 @@ int ReplicatedPG::fill_in_copy_get(
   bool async_read_started = false;
   object_copy_data_t _reply_obj;
   C_CopyFrom_AsyncReadCb *cb = NULL;
+  // modified by omw
+  if ((op->get_flags() & (CEPH_OSD_FLAG_DEDUPE_COPYGET_UPWARD | CEPH_OSD_FLAG_DEDUPE_COPYGET_DOWNWARD |
+			  CEPH_OSD_FLAG_DEDUPE_COPYGET_CAS_DOWNWARD))
+      || oi.is_deduped() ) {
+    return fill_in_copy_get_dedup(ctx, bp, osd_op, obc, classic, cursor, out_max);
+  }
+
   if (pool.info.require_rollback()) {
     cb = new C_CopyFrom_AsyncReadCb(&osd_op, features, classic);
   }
   object_copy_data_t &reply_obj = cb ? cb->reply_obj : _reply_obj;
   // size, mtime
   reply_obj.size = oi.size;
+
   reply_obj.mtime = oi.mtime;
   if (soid.snap < CEPH_NOSNAP) {
     reply_obj.snaps = oi.snaps;
@@ -6970,11 +8581,12 @@ int ReplicatedPG::fill_in_copy_get(
   if (oi.is_data_digest()) {
     reply_obj.flags |= object_copy_data_t::FLAG_DATA_DIGEST;
     reply_obj.data_digest = oi.data_digest;
-  }
+  } 
   if (oi.is_omap_digest()) {
     reply_obj.flags |= object_copy_data_t::FLAG_OMAP_DIGEST;
     reply_obj.omap_digest = oi.omap_digest;
   }
+  
   reply_obj.truncate_seq = oi.truncate_seq;
   reply_obj.truncate_size = oi.truncate_size;
 
@@ -7144,6 +8756,11 @@ void ReplicatedPG::start_copy(CopyCallback *cb, ObjectContextRef obc,
   CopyOpRef cop(std::make_shared<CopyOp>(cb, obc, src, oloc, version, flags,
 			   mirror_snapset, src_obj_fadvise_flags,
 			   dest_obj_fadvise_flags));
+  // modified by omw
+  if (flags & CEPH_OSD_COPY_FROM_FLAG_DEDUPE_ONLY_META) {
+    cop->copy_only_dedup_meta = 1;
+  }
+
   copy_ops[dest] = cop;
   obc->start_block();
 
@@ -7179,6 +8796,13 @@ void ReplicatedPG::_copy_some(ObjectContextRef obc, CopyOpRef cop)
     cop->objecter_tid2 = tid;
   }
 
+  // modified by omw
+  if (cop->flags & (CEPH_OSD_COPY_GET_FLAG_DEDUPE_UPWARD | CEPH_OSD_COPY_FROM_FLAG_DEDUPE_DOWNWARD |
+		    CEPH_OSD_COPY_FROM_FLAG_DEDUPED_CAS_DOWNWARD)) {
+    _copy_some_dedup(obc, cop, gather, flags);
+    return;
+  }
+      
   ObjectOperation op;
   if (cop->results.user_version) {
     op.assert_version(cop->results.user_version);
@@ -7187,6 +8811,7 @@ void ReplicatedPG::_copy_some(ObjectContextRef obc, CopyOpRef cop)
     // it already!
     assert(cop->cursor.is_initial());
   }
+
   op.copy_get(&cop->cursor, get_copy_chunk_size(),
 	      &cop->results.object_size, &cop->results.mtime,
 	      &cop->attrs, &cop->data, &cop->omap_header, &cop->omap_data,
@@ -7226,6 +8851,13 @@ void ReplicatedPG::process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r)
     return;
   }
   CopyOpRef cop = p->second;
+  // modified by omw
+  const object_info_t& oi = cop->obc->obs.oi;
+  map<string,bufferlist>::iterator oi_info;
+  dout(20) << __func__ << " " << oid << " tid " << tid
+	  << " " << cpp_strerror(r) << " offset: " << cop->cursor.data_offset 
+	  << " oi.size: " << oi.size << dendl;
+
   if (tid != cop->objecter_tid) {
     dout(10) << __func__ << " tid " << tid << " != cop " << cop
 	     << " tid " << cop->objecter_tid << dendl;
@@ -7273,6 +8905,42 @@ void ReplicatedPG::process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r)
 
   assert(cop->rval >= 0);
 
+  // dedup storage tier --> cache tier
+  if (cop->flags & CEPH_OSD_COPY_GET_FLAG_DEDUPE_UPWARD) {
+    if (cop->cursor.data_offset ==  cop->obc->obs.oi.deduped_size) {
+      cop->cursor.data_complete = true;
+    }
+    dout(20) << __func__ << " " << __LINE__ << " oid: " << oid << " tid: " << tid 
+	    << " data offset: " << cop->cursor.data_offset
+	    << " deduped_size: " << cop->obc->obs.oi.deduped_size 
+	    << " omap complete: " << cop->cursor.omap_complete << " attr complete: "
+	    << cop->cursor.attr_complete << dendl;
+    cop->results.object_size = cop->cursor.data_offset;
+  }
+
+  // read dedup metadata from storage tier
+  oi_info = cop->attrs.find(OI_ATTR);
+  if (oi_info != cop->attrs.end()) {
+    object_info_t t_obj_info;
+    bufferlist::iterator pp = oi_info->second.begin();
+    ::decode(t_obj_info, pp);
+    /* copy_get from cache tier */
+    if (t_obj_info.is_deduped() && !cobc->obs.oi.test_flag(object_info_t::FLAG_DEDUPED)) {
+      /* we need to make original object */
+      cobc->obs.oi.set_flag(object_info_t::FLAG_DEDUPED);
+      if (cop->copy_only_dedup_meta == -1) {
+	/* read deduped object from storage tier */
+	cop->flags |= CEPH_OSD_COPY_GET_FLAG_DEDUPE_UPWARD;
+	cop->cursor.data_complete = false;
+      }
+      dout(20) << __func__ << " " << __LINE__ 
+	      << " deduped object copy storage tier -> cache tier " 
+	      << " FLAG_DEDUPED size: " 
+	      << cop->results.object_size << " data_complete: " 
+	      << cop->cursor.data_complete << dendl;
+    }
+  }
+
   if (!cop->cursor.is_complete()) {
     // write out what we have so far
     if (cop->temp_cursor.is_initial()) {
@@ -7294,7 +8962,33 @@ void ReplicatedPG::process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r)
   }
 
   cop->results.final_tx = pgbackend->get_transaction();
+  // modified by omw
+  // Data is already written... increase reference count
+  if (cop->flags & CEPH_OSD_COPY_FROM_FLAG_DEDUPE_DOWNWARD) {
+    if (get_ref_dedup(cop->obc) >= 0) {
+      cop->results.need_dedup = true;
+      inc_ref_dedup(cop->obc, cop->results.final_tx);
+      goto out;
+    }   
+  }
+
   _build_finish_copy_transaction(cop, cop->results.final_tx);
+
+  // increase reference count
+  if (cop->flags & CEPH_OSD_COPY_FROM_FLAG_DEDUPE_DOWNWARD) {
+    cop->results.need_dedup = true;
+    // re-check!
+    cop->results.data_digest = cop->data.crc32c(-1);
+    inc_ref_dedup(cop->obc, cop->results.final_tx);
+    goto out;
+  }
+  // modified by omw
+  // disable omap, data digest
+  if (get_pool().enable_dedup && (cop->flags & (CEPH_OSD_COPY_GET_FLAG_DEDUPE_UPWARD |
+      CEPH_OSD_COPY_FROM_FLAG_DEDUPED_CAS_DOWNWARD))) {
+    cop->results.need_dedup = true;
+    goto out;
+  }
 
   // verify digests?
   if (cop->results.is_data_digest() || cop->results.is_omap_digest()) {
@@ -7397,10 +9091,32 @@ void ReplicatedPG::_write_copy_chunk(CopyOpRef cop, PGBackend::PGTransaction *t)
     for (map<string,bufferlist>::iterator p = cop->attrs.begin();
 	 p != cop->attrs.end();
 	 ++p) {
-      cop->results.attrs[string("_") + p->first] = p->second;
-      t->setattr(
-	cop->results.temp_oid,
-	string("_") + p->first, p->second);
+      // for dedup
+      if (!p->first.compare(OI_ATTR)) {
+	bufferlist::iterator pp = p->second.begin();
+	object_info_t t_obj_info;
+	::decode(t_obj_info, pp);
+	/* copy_get from cache tier */
+	if (t_obj_info.is_deduped()) {
+	  cop->obc->obs.oi.deduped_info = t_obj_info.deduped_info;
+	  cop->obc->obs.oi.set_flag(object_info_t::FLAG_DEDUPED);
+	  cop->obc->obs.oi.deduped_size = cop->results.object_size;
+	  cop->results.object_size = 0;
+	  cop->results.attrs[p->first] = p->second;
+	  t->setattr(
+	    cop->results.temp_oid,
+	    p->first, p->second);
+	  dout(20) << __func__ << " " << __LINE__ << " key: " << p->first 
+		  << " deduped_size: " << cop->obc->obs.oi.deduped_size 
+		  << " object size: " << cop->results.object_size << dendl;
+	  //print_deduped_list(cop->obc->obs.oi);
+	}
+      } else {
+	cop->results.attrs[string("_") + p->first] = p->second;
+	t->setattr(
+	  cop->results.temp_oid,
+	  string("_") + p->first, p->second);
+      }
     }
     cop->attrs.clear();
   }
@@ -7497,7 +9213,9 @@ void ReplicatedPG::finish_copyfrom(OpContext *ctx)
     ctx->mod_desc.create();
     replace_cached_attrs(ctx, ctx->obc, cb->results->attrs);
   } else {
-    if (obs.exists) {
+    // modified by omw
+    /* we don't need to delete */
+    if (obs.exists && !cb->results->need_dedup) {
       ctx->op_t->remove(obs.oi.soid);
     }
     ctx->mod_desc.mark_unrollbackable();
@@ -7702,9 +9420,14 @@ void ReplicatedPG::finish_promote(int r, CopyResults *results,
     tctx->new_obs.oi.size = results->object_size;
     tctx->new_obs.oi.user_version = results->user_version;
     // Don't care src object whether have data or omap digest
-    if (results->object_size)
+    // modified by omw
+    dout(20) << __func__ << " data digest: " << results->data_digest 
+	    << " omap digest: " << results->omap_digest 
+	    << " results->object size: " << results->object_size
+	    << " results->has_omap: " << results->has_omap << dendl;
+    if (results->object_size && !results->need_dedup)
       tctx->new_obs.oi.set_data_digest(results->data_digest);
-    if (results->has_omap)
+    if (results->has_omap && !results->need_dedup)
       tctx->new_obs.oi.set_omap_digest(results->omap_digest);
     tctx->new_obs.oi.truncate_seq = results->truncate_seq;
     tctx->new_obs.oi.truncate_size = results->truncate_size;
@@ -8009,6 +9732,16 @@ int ReplicatedPG::start_flush(
   fop->on_flush = std::move(on_flush);
   fop->op = op;
 
+  // modified by omw
+  if (get_pool().enable_dedup && !need_bypass_oid(soid.oid.name)) {
+    if (do_dedup_flush(op, oi, soid, snapc, fop)) {
+      flush_ops[soid] = fop;
+      info.stats.stats.sum.num_flush++;
+      info.stats.stats.sum.num_flush_kb += SHIFT_ROUND_UP(oi.size, 10);
+      return -EINPROGRESS;
+    }
+  }
+
   ObjectOperation o;
   if (oi.is_whiteout()) {
     fop->removal = true;
@@ -8044,19 +9777,773 @@ int ReplicatedPG::start_flush(
   return -EINPROGRESS;
 }
 
+int ReplicatedPG::fill_in_copy_get_dedup(
+  OpContext *ctx,
+  bufferlist::iterator& bp,
+  OSDOp& osd_op,
+  ObjectContextRef &obc,
+  bool classic,
+  object_copy_cursor_t &cursor,
+  uint64_t &out_max)
+{
+  object_info_t& oi = obc->obs.oi;
+  hobject_t& soid = oi.soid;
+  int result = 0;
+
+  MOSDOp *op = reinterpret_cast<MOSDOp*>(ctx->op->get_req());
+  uint64_t features = op->get_features();
+  /* fix me: length can be changed via cache tier's request */
+  uint64_t d_chunk_size = get_pool().dedup_chunk_size;
+
+  bool async_read_started = false;
+  object_copy_data_t _reply_obj;
+  C_CopyFrom_AsyncReadCb *cb = NULL;
+  bool copy_from_lower_tier = false, copy_from_upper_tier = false, 
+	cao_copy_from_upper_tier = false, cao_copy_from_lower_tier = false;
+  if (op->get_flags() & CEPH_OSD_FLAG_DEDUPE_COPYGET_UPWARD) {
+    // oid --> fp oid
+    copy_from_lower_tier = true;
+    dout(15) << __func__ << " storage tier -> cache tier " << dendl;
+  } else if (op->get_flags() & CEPH_OSD_FLAG_DEDUPE_COPYGET_DOWNWARD) {
+    // fp oid --> oid
+    copy_from_upper_tier = true;
+    dout(15) << __func__ << " cache tier -> storage tier " << dendl;
+  } else if (op->get_flags() & CEPH_OSD_FLAG_DEDUPE_COPYGET_CAS_DOWNWARD) { 
+    cao_copy_from_upper_tier = true;
+    dout(15) << __func__ << " cao: cache tier -> storage tier " << dendl;
+  } else if (oi.is_deduped()) {
+    cao_copy_from_lower_tier = true;
+    dout(15) << __func__ << " cao: storage tier -> cache tier " << dendl;
+  } else {
+    assert(0);
+  }
+
+  if (pool.info.require_rollback()) {
+    cb = new C_CopyFrom_AsyncReadCb(&osd_op, features, classic);
+  }
+  object_copy_data_t &reply_obj = cb ? cb->reply_obj : _reply_obj;
+  // size, mtime
+  reply_obj.size = oi.size;
+  if (copy_from_upper_tier) {
+    /* fix me: length can be changed via cache tier's request */
+    reply_obj.size = d_chunk_size;
+  } else if (cao_copy_from_upper_tier) {
+    reply_obj.size = oi.size; 
+  } else if (oi.is_deduped()) {
+    /* dedup meta, storage tier --> cache tier */
+    reply_obj.size = obc->obs.oi.deduped_size;
+    dout(15) << __func__ << " copy_get storage tier -> cache tier size: " 
+	    << reply_obj.size << dendl;
+  }
+
+  reply_obj.mtime = oi.mtime;
+  if (soid.snap < CEPH_NOSNAP) {
+    reply_obj.snaps = oi.snaps;
+  } else {
+    assert(obc->ssc);
+    reply_obj.snap_seq = obc->ssc->snapset.seq;
+  }
+  if (oi.is_data_digest()) {
+    reply_obj.flags |= object_copy_data_t::FLAG_DATA_DIGEST;
+    reply_obj.data_digest = oi.data_digest;
+  } 
+  if (oi.is_omap_digest()) {
+    reply_obj.flags |= object_copy_data_t::FLAG_OMAP_DIGEST;
+    reply_obj.omap_digest = oi.omap_digest;
+  }
+  
+  reply_obj.truncate_seq = oi.truncate_seq;
+  reply_obj.truncate_size = oi.truncate_size;
+
+  // attrs
+  map<string,bufferlist>& out_attrs = reply_obj.attrs;
+  if (!cursor.attr_complete) {
+    result = getattrs_maybe_cache(
+      ctx->obc,
+      &out_attrs,
+      true);
+    if (result < 0) {
+      if (cb) {
+        delete cb;
+      }
+      return result;
+    }
+    if (cao_copy_from_upper_tier || cao_copy_from_lower_tier) {
+      bufferlist list;
+      int r;
+      r = getattr_maybe_cache(ctx->obc, OI_ATTR, &list);
+      if (r == 0) {
+	/* check if object_info_t is updated or not. */
+	object_info_t t_obj_info;
+	bufferlist::iterator pp = list.begin();
+	::decode(t_obj_info, pp);
+	/* object_info_t is not updated. */
+	if (!t_obj_info.is_deduped()) {
+	  list.clear();
+	  ::encode(oi, list);
+	}
+	out_attrs[OI_ATTR] = list;
+      } else {
+	assert(0);
+      }
+    }
+    
+    cursor.attr_complete = true;
+    dout(20) << " got attrs" << dendl;
+    dout(20) << "length: " << out_attrs.size() << " got attrs" << dendl;
+#if 0
+    for (map<string,bufferlist>::iterator iter  = out_attrs.begin();
+	  iter!=out_attrs.end(); ++iter) {
+	dout(0) << " key: " << iter->first << dendl;
+    }
+#endif
+  }
+
+  int64_t left = out_max - osd_op.outdata.length();
+
+  // data
+  bufferlist& bl = reply_obj.data;
+  // modified by omw
+  if (left > 0 && copy_from_lower_tier) {
+    left = MIN(oi.size - 0, (uint64_t)left);
+    if (cb) {
+      async_read_started = true;
+      ctx->pending_async_reads.push_back(
+	make_pair(
+	  boost::make_tuple(0, left, osd_op.op.flags),
+	  make_pair(&bl, cb)));
+      result = left;
+      cb->len = result;
+    } else {
+      result = pgbackend->objects_read_sync(
+	oi.soid, 0, left, osd_op.op.flags, &bl);
+      if (result < 0) {
+	dout(0) << __func__ << " " << __LINE__ << " result: " << result 
+		<< " left: " << left << " data_offset: " << cursor.data_offset << dendl;
+	return result;
+      }
+    }
+    if (result > left) {
+      dout(20) << __func__ << " " << __LINE__ << " result: " << result 
+	      << " left: " << left << " data_offset: " << cursor.data_offset << dendl;
+    }
+    assert(result <= left);
+    left -= result;
+    cursor.data_offset += result;
+    dout(15) << __func__ << " " << __LINE__ << " result: " << result 
+	    << " left: " << left << " data_offset: " << cursor.data_offset << dendl;
+  } else if (left > 0 && copy_from_upper_tier) {
+    int t_offset = -1;
+    uint64_t real_offset = 0;
+    object_t src_name;
+    try {
+      ::decode(src_name, bp);
+    }
+    catch (buffer::error& e) {
+      result = -EINVAL;
+      return result;
+    }
+    if (cursor.data_offset < oi.size) {
+      for (map<uint64_t, dedup_chunk_info_t>::iterator p = 
+	    oi.deduped_info.begin(); p != oi.deduped_info.end();
+	    ++p) {
+	if (p->second.oid_fp == src_name.name) {
+	  t_offset = p->first;
+	}
+      }
+      assert(t_offset != -1); 
+      real_offset = t_offset*d_chunk_size;
+      /* fixed chunk size ! */
+      left = d_chunk_size;
+      if (cb) {
+	async_read_started = true;
+	ctx->pending_async_reads.push_back(
+	  make_pair(
+	    boost::make_tuple(real_offset, left, osd_op.op.flags),
+	    make_pair(&bl, cb)));
+        result = left;
+	cb->len = result;
+      } else {
+	result = pgbackend->objects_read_sync(
+	  oi.soid, real_offset, left, osd_op.op.flags, &bl);
+	if (result < 0)
+	  return result;
+      }
+      assert(result <= left);
+      left -= result;
+      cursor.data_offset += result;
+      dout(15) << __func__ << " " << __LINE__ << " result: " << result 
+	      << " src name: " << src_name.name << " left: " << left << " data_offset: " 
+	      << cursor.data_offset << " t_offset: " << t_offset << dendl;
+    }
+    cursor.data_complete = true;
+    dout(20) << " got data" << dendl;
+
+  } else if (left > 0 && cao_copy_from_upper_tier) {
+    cursor.data_complete = true;
+  } else if (left > 0 && !cursor.data_complete) {
+    if (cursor.data_offset < oi.size) {
+      left = MIN(oi.size - cursor.data_offset, (uint64_t)left);
+      if (cb) {
+	async_read_started = true;
+	ctx->pending_async_reads.push_back(
+	  make_pair(
+	    boost::make_tuple(cursor.data_offset, left, osd_op.op.flags),
+	    make_pair(&bl, cb)));
+        result = left;
+	cb->len = result;
+      } else {
+	result = pgbackend->objects_read_sync(
+	  oi.soid, cursor.data_offset, left, osd_op.op.flags, &bl);
+	if (result < 0)
+	  return result;
+      }
+      assert(result <= left);
+      left -= result;
+      cursor.data_offset += result;
+    }
+    if (cursor.data_offset == oi.size) {
+      cursor.data_complete = true;
+      dout(20) << " got data" << dendl;
+    }
+    assert(cursor.data_offset <= oi.size);
+  }
+
+  // omap
+  uint32_t omap_keys = 0;
+  if (!pool.info.supports_omap() || !oi.is_omap()) {
+    cursor.omap_complete = true;
+  } else {
+    if (left > 0 && !cursor.omap_complete) {
+      assert(cursor.data_complete);
+      if (cursor.omap_offset.empty()) {
+	osd->store->omap_get_header(ch, ghobject_t(oi.soid),
+				    &reply_obj.omap_header);
+      }
+      bufferlist omap_data;
+      ObjectMap::ObjectMapIterator iter =
+	osd->store->get_omap_iterator(coll, ghobject_t(oi.soid));
+      assert(iter);
+      iter->upper_bound(cursor.omap_offset);
+      for (; iter->valid(); iter->next(false)) {
+	++omap_keys;
+	::encode(iter->key(), omap_data);
+	::encode(iter->value(), omap_data);
+	left -= iter->key().length() + 4 + iter->value().length() + 4;
+	if (left <= 0)
+	  break;
+      }
+      if (omap_keys) {
+	::encode(omap_keys, reply_obj.omap_data);
+	reply_obj.omap_data.claim_append(omap_data);
+      }
+      if (iter->valid()) {
+	cursor.omap_offset = iter->key();
+      } else {
+	cursor.omap_complete = true;
+	dout(20) << " got omap" << dendl;
+      }
+    }
+  }
+
+  if (cursor.is_complete()) {
+    // include reqids only in the final step.  this is a bit fragile
+    // but it works...
+    pg_log.get_log().get_object_reqids(ctx->obc->obs.oi.soid, 10, &reply_obj.reqids);
+    dout(20) << " got reqids" << dendl;
+  }
+
+  dout(20) << " cursor.is_complete=" << cursor.is_complete()
+	   << " " << out_attrs.size() << " attrs"
+	   << " " << bl.length() << " bytes"
+	   << " " << reply_obj.omap_header.length() << " omap header bytes"
+	   << " " << reply_obj.omap_data.length() << " omap data bytes in "
+	   << omap_keys << " keys"
+	   << " " << reply_obj.reqids.size() << " reqids"
+	   << dendl;
+  reply_obj.cursor = cursor;
+  if (!async_read_started) {
+    if (classic) {
+      reply_obj.encode_classic(osd_op.outdata);
+    } else {
+      ::encode(reply_obj, osd_op.outdata, features);
+    }
+  }
+  if (cb && !async_read_started) {
+    delete cb;
+  }
+  result = 0;
+  return result;
+}
+
+void ReplicatedPG::_copy_some_dedup(ObjectContextRef obc,CopyOpRef cop, C_GatherBuilder &gather, unsigned &flags)
+{
+  bool copy_from_lower_tier = false, copy_from_upper_tier = false, cas_copy_from_upper_tier = false;
+  uint64_t d_chunk_size = get_pool().dedup_chunk_size;
+  uint64_t index = 0;
+  ObjectOperation op;
+  object_locator_t cas_oloc(obc->obs.oi.soid);
+  cas_oloc.pool = get_pool().cas_pool;
+
+  if (cop->flags & CEPH_OSD_COPY_GET_FLAG_DEDUPE_UPWARD) { 
+    copy_from_lower_tier = true;
+    flags |= CEPH_OSD_FLAG_DEDUPE_COPYGET_UPWARD;
+    dout(15) << __func__ << " storage tier -> cache tier " << dendl;
+  } else if (cop->flags & CEPH_OSD_COPY_FROM_FLAG_DEDUPE_DOWNWARD) {
+    copy_from_upper_tier = true;
+    flags |= CEPH_OSD_FLAG_DEDUPE_COPYGET_DOWNWARD;
+    dout(15) << __func__ << " cache tier -> storage tier " << dendl;
+    //print_deduped_list(obc->obs.oi);
+  } else if (cop->flags & CEPH_OSD_COPY_FROM_FLAG_DEDUPED_CAS_DOWNWARD) {
+    cas_copy_from_upper_tier = true;
+    flags |= CEPH_OSD_FLAG_DEDUPE_COPYGET_CAS_DOWNWARD; 
+    dout(15) << __func__ << " cas: cache tier -> storage tier " << dendl;
+    //print_deduped_list(obc->obs.oi);
+  } else {
+    assert(0);
+  }
+      
+  if (cop->results.user_version) {
+    /* TO DO : how do we handle version ? */
+    if (!copy_from_lower_tier && !copy_from_upper_tier && !cas_copy_from_upper_tier)
+    op.assert_version(cop->results.user_version);
+  } else {
+    // we should learn the version after the first chunk, if we didn't know
+    // it already!
+    assert(cop->cursor.is_initial());
+  }
+
+  object_t oid;
+  ceph_tid_t tid = 0;
+  C_Copyfrom *fin = new C_Copyfrom(this, obc->obs.oi.soid,
+				   get_last_peering_reset(), cop);
+  gather.set_finisher(new C_OnFinisher(fin,
+				       &osd->objecter_finisher));
+
+  if (copy_from_upper_tier || cas_copy_from_upper_tier) {
+    op.copy_get(&cop->cursor, get_copy_chunk_size(),
+		&cop->results.object_size, &cop->results.mtime,
+		&cop->attrs, &cop->data, &cop->omap_header, &cop->omap_data,
+		&cop->results.snaps, &cop->results.snap_seq,
+		&cop->results.flags,
+		&cop->results.source_data_digest,
+		&cop->results.source_omap_digest,
+		&cop->results.reqids,
+		&cop->results.truncate_seq,
+		&cop->results.truncate_size,
+		&cop->rval,
+		obc->obs.oi.soid.oid.name);
+    op.set_last_op_flags(cop->src_obj_fadvise_flags);
+    oid = cop->src.oid;
+    tid = osd->objecter->read(oid, cop->oloc, op,
+				    cop->src.snap, NULL,
+				    flags,
+				    gather.new_sub(),
+				    // discover the object version if we don't know it yet
+				    cop->results.user_version ? NULL : &cop->results.user_version);
+  } else if (copy_from_lower_tier) {
+    // re-check !!
+    index = get_dedup_index(cop->cursor.data_offset);
+    //string fp = obc->obs.oi.deduped_info[index].get<1>();
+    string fp = obc->obs.oi.deduped_info[index].oid_fp;
+
+    op.copy_get(&cop->cursor, d_chunk_size,
+		&cop->results.object_size, &cop->results.mtime,
+		&cop->attrs, &cop->data, &cop->omap_header, &cop->omap_data,
+		&cop->results.snaps, &cop->results.snap_seq,
+		&cop->results.flags,
+		&cop->results.source_data_digest,
+		&cop->results.source_omap_digest,
+		&cop->results.reqids,
+		&cop->results.truncate_seq,
+		&cop->results.truncate_size,
+		&cop->rval);
+    op.set_last_op_flags(cop->src_obj_fadvise_flags);
+    oid = fp;
+    flags |= CEPH_OSD_FLAG_DEDUPE_READ;
+    tid = osd->objecter->read(oid, cas_oloc, op,
+				    cop->src.snap, NULL,
+				    flags,
+				    gather.new_sub(),
+				    // discover the object version if we don't know it yet
+				    cop->results.user_version ? NULL : &cop->results.user_version);
+  }
+  dout(15) << __func__ << " " << __LINE__ << " ori oid: " << obc->obs.oi.soid 
+	  << " offset: " << cop->cursor.data_offset 
+	  << " index: " << index << " fp: " << oid.name << dendl;
+
+
+  fin->tid = tid;
+  cop->objecter_tid = tid;
+  gather.activate();
+}
+
+void ReplicatedPG::print_deduped_list(object_info_t &oi)
+{
+  for (map<uint64_t, dedup_chunk_info_t>::iterator p = 
+	oi.deduped_info.begin(); p != oi.deduped_info.end();
+	++p) {
+    dout(0) << " deduped offset: " << p->first << " val: " 
+	    << p->second.oid_fp << dendl;
+  }
+}
+
+/* To do:
+ *  Support snap
+ *  Test ACTIVE mode 
+ */
+int ReplicatedPG::do_dedup_flush(OpRequestRef op, const object_info_t& oi, const hobject_t& soid, 
+				  SnapContext &snapc, FlushOpRef fop)
+{
+
+  object_locator_t base_oloc(soid);
+  base_oloc.pool = pool.info.tier_of;
+  uint64_t d_chunk_size = get_pool().dedup_chunk_size;
+  object_locator_t cas_oloc(soid);
+  object_locator_t oloc(soid);
+  cas_oloc.pool = get_pool().cas_pool;
+  int mode = DE_PASSIVE, r; 
+  dout(20) << __func__ << " " << __LINE__ << " oid: " << soid.oid.name 
+	  << " object size: " << oi.size << " cas_pool " << cas_oloc.pool 
+	  << " key: " << base_oloc.key << " nspace: " << base_oloc.nspace 
+	  << " chunk_size " << d_chunk_size << dendl;
+  assert(cas_oloc.pool != -1);
+
+  if (need_bypass_oid(soid.oid.name)) {
+    return 0;
+  }
+
+  /* To do: 
+   * 1. Send cas query first before sending write in DE_ACTIVE 
+   * */
+
+  if (mode == DE_PASSIVE) {
+    const hobject_t& soid = oi.soid;
+    ceph_tid_t tid;
+    uint64_t obj_offset = 0;
+    ObjectOperation o, o_empty;
+    ObjectContextRef obc = get_object_context(soid, false);
+    assert(obc);
+    C_GatherBuilder gather(g_ceph_context);
+    C_Flush *fin = new C_Flush(this, soid, get_last_peering_reset());
+    gather.set_finisher(new C_OnFinisher(fin,
+					 &osd->objecter_finisher));
+    if (!oi.is_deduped()) {
+      obc->obs.oi.set_flag(object_info_t::FLAG_DEDUPED);
+    }
+
+    while (obj_offset < oi.size) {
+      bufferlist ob_data;
+      uint64_t read_block_size = 0;
+      ChunknFPRef cnf(std::make_shared<ChunknFP>(FIXED_CHUNK, d_chunk_size, FP_SHA1));
+      SnapContext snapc;
+      unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | 
+			CEPH_OSD_FLAG_ENFORCE_SNAPC | CEPH_OSD_FLAG_RWORDERED;
+      if (oi.is_whiteout()) {
+	fop->removal = true;
+	o.remove();
+      } 
+
+      uint64_t cursor = obj_offset;
+      uint64_t index  = get_dedup_index(cursor);
+      for (;cursor < oi.size; cursor+=d_chunk_size) {
+	index = get_dedup_index(cursor);
+	if (oi.deduped_info.find(index) != oi.deduped_info.end()) {
+	  char chk_state = obc->obs.oi.deduped_info[index].chk_state;
+	  if (chk_state == C_CLEAN || chk_state == C_PRE_CAL) {
+	    break;
+	  }
+	} 
+	read_block_size += d_chunk_size;
+      }
+
+      if (fop->removal) {
+	//string oid_fp = p->second.oid_fp; 
+	string oid_fp = obc->obs.oi.deduped_info[index].oid_fp; 
+	object_t oid(oid_fp);
+	tid = osd->objecter->mutate(
+	  oid, cas_oloc, o, snapc,
+	  ceph::real_clock::from_ceph_timespec(oi.mtime),
+	  flags,
+	  NULL, gather.new_sub());
+	read_block_size = d_chunk_size;
+      } else if (read_block_size > 0) {
+	r = pgbackend->objects_read_sync(
+	    soid, obj_offset, read_block_size, 0, &ob_data);
+	assert(r >= 0);
+	
+	if ((r % d_chunk_size) && (oi.size % d_chunk_size)) {
+	  /* add padding */
+	  uint64_t remain_len = r % d_chunk_size;
+	  bufferptr tmp_buf(d_chunk_size - remain_len);
+	  tmp_buf.zero();
+	  ob_data.push_back(std::move(tmp_buf));
+	  dout(20) << __func__ << " " << __LINE__ << " remain_len " << remain_len << dendl;
+	}
+	cnf->do_cnf(ob_data); 
+
+	dout(15) << __func__ << " " << __LINE__ << " oid: " << soid.oid.name
+		<< " read: " << r << " entry cnt: " << cnf->get_entry_size()
+		<< " offset: " << obj_offset <<" C_STATE: " 
+		<< (int)obc->obs.oi.deduped_info[index].chk_state << dendl;
+	//print_deduped_list(obc->obs.oi);
+
+	for (int i=0; i<cnf->get_entry_size(); i++) {
+	  uint64_t offset = cnf->get_chunk_offset(i);
+	  string oid_fp = cnf->get_fp_to_string(i);
+	  o.copy_from(soid.oid.name, soid.snap, oloc, oi.user_version,
+		      CEPH_OSD_COPY_FROM_FLAG_FLUSH |
+		      CEPH_OSD_COPY_FROM_FLAG_IGNORE_OVERLAY |
+		      CEPH_OSD_COPY_FROM_FLAG_IGNORE_CACHE |
+		      CEPH_OSD_COPY_FROM_FLAG_MAP_SNAP_CLONE |
+		      CEPH_OSD_COPY_FROM_FLAG_DEDUPE_DOWNWARD,
+		      LIBRADOS_OP_FLAG_FADVISE_SEQUENTIAL|LIBRADOS_OP_FLAG_FADVISE_NOCACHE);
+	  if (agent_state && agent_state->evict_mode != TierAgentState::EVICT_MODE_FULL)
+	    o.set_last_op_flags(LIBRADOS_OP_FLAG_FADVISE_DONTNEED);
+
+	  /* We can avoid overwirte the data which is the same as previous written */
+	  string prev_fp;
+	  int tmp_index = get_dedup_index(obj_offset+offset);
+	  search_fp(soid, obj_offset+offset, prev_fp);
+	  if (oid_fp == prev_fp) {
+	    dout(15) << __func__ << " data is already stored (same fp) " << " oid: " << oid_fp 
+		    << " offset: " << offset << dendl;
+	    continue;
+	  }
+
+	  if (!prev_fp.empty()) {
+	    object_t oid(prev_fp);
+	    dedup_dec_ref(soid, oid, gather.new_sub(), snapc,
+			  ceph::real_clock::from_ceph_timespec(oi.mtime));
+	  }
+	  /* We should update metadata first because data is already stored in cache tier */
+	  obc->obs.oi.deduped_info[tmp_index].oid_fp = oid_fp;
+
+	  object_t oid(oid_fp);
+	  tid = osd->objecter->mutate(
+	    oid, cas_oloc, o, snapc,
+	    ceph::real_clock::from_ceph_timespec(oi.mtime),
+	    flags,
+	    NULL, gather.new_sub());
+	}
+      } else if (obc->obs.oi.deduped_info[index].chk_state == C_PRE_CAL) {
+	string oid_fp = obc->obs.oi.deduped_info[index].oid_fp; 
+	dout(20) << " C_STATE: " << (int)obc->obs.oi.deduped_info[index].chk_state << dendl;
+	object_t oid(oid_fp);
+	o.copy_from(soid.oid.name, soid.snap, oloc, oi.user_version,
+		    CEPH_OSD_COPY_FROM_FLAG_FLUSH |
+		    CEPH_OSD_COPY_FROM_FLAG_IGNORE_OVERLAY |
+		    CEPH_OSD_COPY_FROM_FLAG_IGNORE_CACHE |
+		    CEPH_OSD_COPY_FROM_FLAG_MAP_SNAP_CLONE |
+		    CEPH_OSD_COPY_FROM_FLAG_DEDUPE_DOWNWARD,
+		    LIBRADOS_OP_FLAG_FADVISE_SEQUENTIAL|LIBRADOS_OP_FLAG_FADVISE_NOCACHE);
+	if (agent_state && agent_state->evict_mode != TierAgentState::EVICT_MODE_FULL)
+	  o.set_last_op_flags(LIBRADOS_OP_FLAG_FADVISE_DONTNEED);
+	tid = osd->objecter->mutate(
+	  oid, cas_oloc, o, snapc,
+	  ceph::real_clock::from_ceph_timespec(oi.mtime),
+	  flags,
+	  NULL, gather.new_sub());
+
+	read_block_size = d_chunk_size;
+      } else if (obc->obs.oi.deduped_info[index].chk_state == C_CLEAN) {
+	read_block_size = d_chunk_size;
+	dout(15) << " C_STATE: " << (int)obc->obs.oi.deduped_info[index].chk_state << dendl;
+      } else {
+	assert(0);
+      }
+      dout(15) << __func__ << " " << __LINE__ << " oid: " << soid.oid.name
+	      << " offset: " << obj_offset  << " read block: " << read_block_size
+	      << " C_STATE: " << (int)obc->obs.oi.deduped_info[index].chk_state << dendl;
+      obj_offset += read_block_size;
+    }
+    // object metadata
+    o_empty.copy_from(soid.oid.name, soid.snap, oloc, oi.user_version,
+		CEPH_OSD_COPY_FROM_FLAG_FLUSH |
+		CEPH_OSD_COPY_FROM_FLAG_IGNORE_OVERLAY |
+		CEPH_OSD_COPY_FROM_FLAG_IGNORE_CACHE |
+		CEPH_OSD_COPY_FROM_FLAG_MAP_SNAP_CLONE |
+		CEPH_OSD_COPY_FROM_FLAG_DEDUPED_CAS_DOWNWARD,
+		LIBRADOS_OP_FLAG_FADVISE_SEQUENTIAL|LIBRADOS_OP_FLAG_FADVISE_NOCACHE);
+
+    //mean the base tier don't cache data after this
+    if (agent_state && agent_state->evict_mode != TierAgentState::EVICT_MODE_FULL)
+      o_empty.set_last_op_flags(LIBRADOS_OP_FLAG_FADVISE_DONTNEED);
+    
+    tid = osd->objecter->mutate(
+      soid.oid, base_oloc, o_empty, snapc,
+      ceph::real_clock::from_ceph_timespec(oi.mtime),
+      CEPH_OSD_FLAG_IGNORE_OVERLAY | CEPH_OSD_FLAG_ENFORCE_SNAPC,
+      NULL, gather.new_sub());
+
+    gather.activate();
+    fin->tid = tid;
+    fop->objecter_tid = tid;
+    fop->dedup = true;
+
+    return 1;
+  } else if (mode == DE_ACTIVE) {
+    const hobject_t& soid = oi.soid;
+    uint64_t obj_offset = 0;
+    ceph_tid_t tid;
+    C_Flush *fin = new C_Flush(this, soid, get_last_peering_reset());
+    C_GatherBuilder gather(g_ceph_context);
+    ObjectContextRef obc = get_object_context(soid, false);
+    assert(obc);
+    gather.set_finisher(new C_OnFinisher(fin,
+					 &osd->objecter_finisher));
+    obc->obs.oi.set_flag(object_info_t::FLAG_DEDUPED);
+
+    while (obj_offset < oi.size) {
+      bufferlist ob_data;
+      char * data_pos;
+      int r = pgbackend->objects_read_sync(
+	  soid, obj_offset, DEDUPE_READ_BLOCK, 0, &ob_data);
+      assert(r >= 0);
+
+      ChunknFPRef cnf(std::make_shared<ChunknFP>(FIXED_CHUNK, d_chunk_size, FP_SHA1, ob_data));
+      cnf->do_cnf(); 
+      data_pos = ob_data.c_str();
+      assert(data_pos);
+
+      dout(15) << __func__ << " " << __LINE__ << " oid: " << soid.oid.name
+	      << " read: " << r   
+	      << " offset: " << obj_offset << dendl;
+
+      for (int i=0; i<cnf->get_entry_size(); i++) {
+	uint64_t offset = cnf->get_chunk_offset(i);
+	uint64_t len = cnf->get_chunk_len(i);
+	string oid_fp = cnf->get_fp_to_string(i);
+
+	/* We can avoid overwirte the data which is the same as previous written */
+	string prev_fp;
+	search_fp(soid, offset, prev_fp);
+	if (oid_fp == prev_fp) {
+	  dout(15) << __func__ << " data is already stored (same fp) " << " oid: " << oid_fp 
+		  << " offset: " << offset << dendl;
+	  continue;
+	}
+	/* We should update metadata first because data is already stored in cache tier */
+	update_dedup_obj_meta(soid, op, oid_fp, snapc,
+				obj_offset+offset, len, false);
+
+	bufferlist tmp_buf;
+	assert(len);
+	bufferptr tmp_ptr(len);
+	tmp_ptr.zero();
+	tmp_buf.append(tmp_ptr);
+	tmp_buf.copy_in(0, len, data_pos+offset);
+	ObjectOperation * w_obj_op = new ObjectOperation;
+	assert(w_obj_op);
+	addop_dedup_write(w_obj_op, tmp_buf);
+
+	unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY;
+	flags |= (CEPH_OSD_FLAG_RWORDERED | CEPH_OSD_FLAG_DEDUPE_WRITE);
+	object_t oid(oid_fp);
+	tid = osd->objecter->mutate(
+	  oid, cas_oloc, *w_obj_op, snapc,
+	  ceph::real_clock::from_ceph_timespec(oi.mtime),
+	  flags, NULL, gather.new_sub());
+
+	dout(15) << __func__ << " " << __LINE__ << " offset: " 
+		<< offset << " len: " << len << " oid: " << oid_fp << " tmp_buf len: " 
+		<< tmp_buf.length() << " ori oid: " << soid.oid.name << " tid: " << tid << dendl;
+
+	tmp_buf.clear();
+      }
+
+      obj_offset += DEDUPE_READ_BLOCK;
+    }
+
+    // update metadata
+    // fix me
+    string key_deduped_ob = DEDUPE_INFO;
+
+    ObjectOperation deduped_ob_op;
+    bufferlist list;
+    ::encode(obc->obs.oi.deduped_info, list);
+    addop_dedup_xattr(&deduped_ob_op, key_deduped_ob, list);
+    unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | CEPH_OSD_FLAG_RWORDERED
+		      | CEPH_OSD_FLAG_DEDUPE_WRITE;
+    osd->objecter->setdedupxattr(soid.oid, base_oloc, &deduped_ob_op, snapc, 
+				      ceph::real_clock::from_ceph_timespec(oi.mtime),
+				      flags,
+				      NULL, gather.new_sub());
+
+    fin->tid = tid;
+    fop->objecter_tid = tid;
+    fop->dedup = true;
+    gather.activate();
+
+    return 1;
+
+  } else {
+    assert(0);
+  }
+  return 0;
+}
+
+ceph_tid_t ReplicatedPG::dedup_dec_ref(hobject_t soid, object_t prev_oid, Context *fin, 
+				      SnapContext &snapc, ceph::real_time mtime)
+{
+  ObjectOperation obj_op;
+  bufferlist list;
+  object_locator_t cas_oloc(soid);
+  cas_oloc.pool = get_pool().cas_pool;
+  unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | CEPH_OSD_FLAG_RWORDERED
+		    | CEPH_OSD_FLAG_DEDUPE_WRITE;
+  ::encode(prev_oid, list);
+  addop_dedup_xattr(&obj_op, DEREFERENCE_OID, list);
+  ceph_tid_t tid = osd->objecter->setdedupxattr(prev_oid, cas_oloc, &obj_op, snapc, 
+					      mtime,
+					      flags,
+					      NULL, fin);
+  return tid;
+}
+
+ceph_tid_t ReplicatedPG::dedup_set_meta_info(hobject_t soid, object_t oid, Context *fin, 
+					      SnapContext &snapc, ceph::real_time mtime,
+					      uint64_t offset)
+{
+  ObjectOperation deduped_ob_op;
+  bufferlist list;
+  object_locator_t oloc(soid);
+  uint64_t off = 0;
+  off = get_dedup_index(offset);
+  string key_deduped_ob = DEDUPE_OFFSET+to_string(off);
+
+  oloc.pool = pool.info.tier_of;
+
+  unsigned flags = CEPH_OSD_FLAG_IGNORE_CACHE | CEPH_OSD_FLAG_IGNORE_OVERLAY | CEPH_OSD_FLAG_RWORDERED
+		    | CEPH_OSD_FLAG_DEDUPE_WRITE;
+  ::encode(oid, list);
+  addop_dedup_xattr(&deduped_ob_op, key_deduped_ob, list);
+  ceph_tid_t tid = osd->objecter->setdedupxattr(soid.oid, oloc, &deduped_ob_op, snapc, 
+					      mtime,
+					      flags,
+					      NULL, fin);
+  dout(0) << __func__ << " " << __LINE__ //<< " fp oid: " << target.name
+	  << " ori oid: " << soid.oid.name << " tid: " << tid 
+	  << " key_dedupe_ob: " << key_deduped_ob << dendl;
+  return tid;
+}
+
 void ReplicatedPG::finish_flush(hobject_t oid, ceph_tid_t tid, int r)
 {
-  dout(10) << __func__ << " " << oid << " tid " << tid
+  // modified by omw
+  dout(15) << __func__ << " " << oid << " tid " << tid
 	   << " " << cpp_strerror(r) << dendl;
   map<hobject_t,FlushOpRef, hobject_t::BitwiseComparator>::iterator p = flush_ops.find(oid);
   if (p == flush_ops.end()) {
-    dout(10) << __func__ << " no flush_op found" << dendl;
+    // modified by omw
+    dout(0) << __func__ << " no flush_op found" << dendl;
     return;
   }
   FlushOpRef fop = p->second;
-  if (tid != fop->objecter_tid) {
+  if (tid != fop->objecter_tid && fop->dedup == false) {
     dout(10) << __func__ << " tid " << tid << " != fop " << fop
 	     << " tid " << fop->objecter_tid << dendl;
+    assert(0);
     return;
   }
   ObjectContextRef obc = fop->obc;
@@ -8093,6 +10580,13 @@ int ReplicatedPG::try_flush_mark_clean(FlushOpRef fop)
   ObjectContextRef obc = fop->obc;
   const hobject_t& oid = obc->obs.oi.soid;
 
+  if (obc->obs.oi.is_deduped()) {
+    for (map<uint64_t, dedup_chunk_info_t>::iterator p = 
+	  obc->obs.oi.deduped_info.begin(); p != obc->obs.oi.deduped_info.end();
+	  ++p) {
+      p->second.chk_state = C_CLEAN;
+    }
+  }
   if (fop->blocking) {
     obc->stop_block();
     kick_object_context_blocked(obc);
@@ -8427,8 +10921,6 @@ void ReplicatedPG::eval_repop(RepGather *repop)
     assert(!repop_queue.empty());
     dout(20) << "   q front is " << *repop_queue.front() << dendl; 
     if (repop_queue.front() != repop) {
-      dout(0) << " removing " << *repop << dendl;
-      dout(0) << "   q front is " << *repop_queue.front() << dendl; 
       assert(repop_queue.front() == repop);
     }
     repop_queue.pop_front();
@@ -12079,6 +14571,7 @@ bool ReplicatedPG::agent_maybe_flush(ObjectContextRef& obc)
   osd->agent_start_op(oid);
   // no need to capture a pg ref, can't outlive fop or ctx
   std::function<void()> on_flush = [this, oid]() {
+    dout(0) << __func__ << " agent_ops: " << osd->agent_ops << dendl;
     osd->agent_finish_op(oid);
   };
 
@@ -12300,6 +14793,7 @@ bool ReplicatedPG::agent_choose_mode(bool restart, OpRequestRef op)
 	   << " pool.info.target_max_bytes: " << pool.info.target_max_bytes
 	   << " pool.info.target_max_objects: " << pool.info.target_max_objects
 	   << dendl;
+
 
   // get dirty, full ratios
   uint64_t dirty_micro = 0;

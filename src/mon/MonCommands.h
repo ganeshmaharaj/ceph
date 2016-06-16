@@ -813,6 +813,21 @@ COMMAND("osd tier remove-overlay " \
 COMMAND("osd tier rm-overlay " \
 	"name=pool,type=CephPoolname ", \
 	"remove the overlay pool for base pool <pool>", "osd", "rw", "cli,rest")
+// modified by omw
+COMMAND("osd tier add_cas " \
+	"name=pool,type=CephPoolname " \
+	"name=tierpool,type=CephPoolname " \
+	"name=caspool,type=CephPoolname " \
+	"name=force_nonempty,type=CephChoices,strings=--force-nonempty,req=false",
+	"add_cas the tier <tierpool> (the second one) to base pool <pool> (the first one)", \
+	"osd", "rw", "cli,rest")
+COMMAND("osd tier dedup_block " \
+	"name=pool,type=CephPoolname " \
+	"name=tierpool,type=CephPoolname " \
+	"name=caspool,type=CephPoolname " \
+	"name=block_size,type=CephInt,range=0 ", \
+	"dedup_block the tier <tierpool> (the second one) to base pool <pool> (the first one)", \
+	"osd", "rw", "cli,rest")
 
 COMMAND("osd tier add-cache " \
 	"name=pool,type=CephPoolname " \

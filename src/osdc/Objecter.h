@@ -745,6 +745,43 @@ struct ObjectOperation {
     }
   };
 
+  // modified by omw
+  void copy_get(object_copy_cursor_t *cursor,
+		uint64_t max,
+		uint64_t *out_size,
+		ceph::real_time *out_mtime,
+		std::map<std::string,bufferlist> *out_attrs,
+		bufferlist *out_data,
+		bufferlist *out_omap_header,
+		bufferlist *out_omap_data,
+		vector<snapid_t> *out_snaps,
+		snapid_t *out_snap_seq,
+		uint32_t *out_flags,
+		uint32_t *out_data_digest,
+		uint32_t *out_omap_digest,
+		vector<pair<osd_reqid_t, version_t> > *out_reqids,
+		uint64_t *truncate_seq,
+		uint64_t *truncate_size,
+		int *prval,
+		object_t src) {
+    OSDOp& osd_op = add_op(CEPH_OSD_OP_COPY_GET);
+    osd_op.op.copy_get.max = max;
+    ::encode(*cursor, osd_op.indata);
+    ::encode(max, osd_op.indata);
+    ::encode(src, osd_op.indata);
+    unsigned p = ops.size() - 1;
+    out_rval[p] = prval;
+    C_ObjectOperation_copyget *h =
+      new C_ObjectOperation_copyget(cursor, out_size, out_mtime,
+				    out_attrs, out_data, out_omap_header,
+				    out_omap_data, out_snaps, out_snap_seq,
+				    out_flags, out_data_digest,
+				    out_omap_digest, out_reqids, truncate_seq,
+				    truncate_size, prval);
+    out_bl[p] = &h->bl;
+    out_handler[p] = h;
+  }
+
   void copy_get(object_copy_cursor_t *cursor,
 		uint64_t max,
 		uint64_t *out_size,
@@ -2199,6 +2236,33 @@ public:
     op_submit(o, &tid);
     return tid;
   }
+  // modified by omw
+  /**
+   * set up initial ops in the op vector, and allocate a final op slot.
+   *
+   * The caller is responsible for filling in the final ops_count ops.
+   *
+   * @param ops op vector
+   * @param ops_count number of final ops the caller will fill in
+   * @param extra_ops pointer to [array of] initial op[s]
+   * @return index of final op (for caller to fill in)
+   */
+  int init_ops(vector<OSDOp>& ops, int ops_count, ObjectOperation *extra_ops) {
+    int i;
+    int extra = 0;
+
+    if (extra_ops)
+      extra = extra_ops->ops.size();
+
+    ops.resize(ops_count + extra);
+
+    for (i=0; i<extra; i++) {
+      ops[i] = extra_ops->ops[i];
+    }
+
+    return i;
+  }
+
   Op *prepare_read_op(
     const object_t& oid, const object_locator_t& oloc,
     ObjectOperation& op,
@@ -2289,6 +2353,7 @@ public:
 
   void _do_watch_notify(LingerOp *info, MWatchNotify *m);
 
+#if 0
   /**
    * set up initial ops in the op vector, and allocate a final op slot.
    *
@@ -2314,6 +2379,7 @@ public:
 
     return i;
   }
+#endif
 
 
   // high-level helpers
@@ -2446,6 +2512,24 @@ public:
     C_GetAttrs *fin = new C_GetAttrs(attrset, onfinish);
     Op *o = new Op(oid, oloc, ops, flags | global_op_flags.read() |
 		   CEPH_OSD_FLAG_READ, fin, 0, objver);
+    o->snapid = snap;
+    o->outbl = &fin->bl;
+    ceph_tid_t tid;
+    op_submit(o, &tid);
+    return tid;
+  }
+  
+  // modified by omw
+  ceph_tid_t getdedupattrs(const object_t& oid, const object_locator_t& oloc,
+		       snapid_t snap, map<string,bufferlist>& attrset,
+		       int flags, Context *onfinish, version_t *objver = NULL,
+		       ObjectOperation *extra_ops = NULL) {
+    vector<OSDOp> ops;
+    int i = init_ops(ops, 1, extra_ops);
+    ops[i].op.op = CEPH_OSD_OP_DEDUPE_GETXATTRS;
+    C_GetAttrs *fin = new C_GetAttrs(attrset, onfinish);
+    Op *o = new Op(oid, oloc, ops, flags | global_op_flags.read() |
+		   CEPH_OSD_FLAG_READ | CEPH_OSD_FLAG_DEDUPE_READ, fin, 0, objver);
     o->snapid = snap;
     o->outbl = &fin->bl;
     ceph_tid_t tid;
@@ -2709,6 +2793,20 @@ public:
     ops[i].indata.append(bl);
     Op *o = new Op(oid, oloc, ops, flags | global_op_flags.read() |
 		   CEPH_OSD_FLAG_WRITE, onack, oncommit, objver);
+    o->mtime = mtime;
+    o->snapc = snapc;
+    ceph_tid_t tid;
+    op_submit(o, &tid);
+    return tid;
+  }
+  // modified by omw
+  ceph_tid_t setdedupxattr(const object_t& oid, const object_locator_t& oloc,
+	      ObjectOperation * o_op, const SnapContext& snapc, 
+	      ceph::real_time mtime, int flags,
+	      Context *onack, Context *oncommit,
+	      version_t *objver = NULL, ObjectOperation *extra_ops = NULL) {
+    Op *o = new Op(oid, oloc, o_op->ops, flags | global_op_flags.read() |
+		   CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_DEDUPE_WRITE, onack, oncommit, objver);
     o->mtime = mtime;
     o->snapc = snapc;
     ceph_tid_t tid;

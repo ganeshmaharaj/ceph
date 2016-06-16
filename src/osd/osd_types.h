@@ -272,6 +272,8 @@ enum {
   CEPH_OSD_RMW_FLAG_FORCE_PROMOTE   = (1 << 7),
   CEPH_OSD_RMW_FLAG_SKIP_HANDLE_CACHE = (1 << 8),
   CEPH_OSD_RMW_FLAG_SKIP_PROMOTE      = (1 << 9),
+  // modified by omw
+  CEPH_OSD_RMW_FLAG_DEDUPE	= (1 << 10),
 };
 
 
@@ -1027,6 +1029,9 @@ private:
 };
 WRITE_CLASS_ENCODER(pool_opts_t)
 
+// modified by omw
+#define DEDUPE_DEFAULT_BLOCK_SIZE (128*1024)
+
 /*
  * pg_pool
  */
@@ -1281,6 +1286,14 @@ public:
 
   pool_opts_t opts; ///< options
 
+  // modified by omw
+  bool enable_dedup;
+  uint64_t dedup_chunk_size;
+  int chunk_method; ///< fixed
+  int hash_method; ///< SHA1
+  int cas_pool;
+  
+
 private:
   vector<uint32_t> grade_table;
 
@@ -1329,7 +1342,12 @@ public:
       stripe_width(0),
       expected_num_objects(0),
       fast_read(false),
-      opts()
+      opts(),
+      enable_dedup(false),
+      dedup_chunk_size(DEDUPE_DEFAULT_BLOCK_SIZE),
+      chunk_method(0),
+      hash_method(0),
+      cas_pool(-1)
   { }
 
   void dump(Formatter *f) const;
@@ -3237,6 +3255,19 @@ static inline ostream& operator<<(ostream& out, const notify_info_t& n) {
 	     << " " << n.timeout << "s)";
 }
 
+// modified by omw
+struct dedup_chunk_info_t {
+  uint64_t length;
+  string oid_fp;
+  uint64_t cas_pool;
+  char chk_state;
+  void encode(bufferlist& bl) const;
+  void decode(bufferlist::iterator& bl);
+  dedup_chunk_info_t() : length(0), cas_pool(-1) { }
+  dedup_chunk_info_t(uint64_t len, string fp, uint64_t cas_pool, char chk_state) : length(len),
+		  oid_fp(fp), cas_pool(cas_pool), chk_state(chk_state) { }
+};
+WRITE_CLASS_ENCODER(dedup_chunk_info_t)
 
 struct object_info_t {
   hobject_t soid;
@@ -3259,6 +3290,8 @@ struct object_info_t {
     FLAG_OMAP_DIGEST = 1 << 5,  // has omap crc
     FLAG_CACHE_PIN = 1 << 6,    // pin the object in cache tier
     // ...
+    // modified by omw
+    FLAG_DEDUPED = 1 << 7,
     FLAG_USES_TMAP = 1<<8,  // deprecated; no longer used.
   } flag_t;
 
@@ -3282,6 +3315,9 @@ struct object_info_t {
       s += "|omap_digest";
     if (flags & FLAG_CACHE_PIN)
       s += "|cache_pin";
+    // modified by omw
+    if (flags & FLAG_DEDUPED)
+      s += "|deduped";
     if (s.length())
       return s.substr(1);
     return s;
@@ -3299,6 +3335,10 @@ struct object_info_t {
   // opportunistic checksums; may or may not be present
   __u32 data_digest;  ///< data crc32c
   __u32 omap_digest;  ///< omap crc32c
+
+  // modified by omw
+  map<uint64_t, dedup_chunk_info_t> deduped_info;
+  uint64_t deduped_size;
 
   void copy_user_bits(const object_info_t& other);
 
@@ -3334,6 +3374,10 @@ struct object_info_t {
   }
   bool is_cache_pinned() const {
     return test_flag(FLAG_CACHE_PIN);
+  }
+  // modified by omw
+  bool is_deduped() const {
+    return test_flag(FLAG_DEDUPED);
   }
 
   void set_data_digest(__u32 d) {

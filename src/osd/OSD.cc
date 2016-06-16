@@ -9049,6 +9049,12 @@ int OSD::init_op_flags(OpRequestRef& op)
 
   // set bits based on op codes, called methods.
   for (iter = m->ops.begin(); iter != m->ops.end(); ++iter) {
+
+    /* in the case of dedupe msg, seting ref count is needed */ 
+    if (m->get_flags() & CEPH_OSD_FLAG_DEDUPE_WRITE) {
+      op->set_read();
+    }
+
     if (ceph_osd_op_mode_modify(iter->op.op))
       op->set_write();
     if (ceph_osd_op_mode_read(iter->op.op))

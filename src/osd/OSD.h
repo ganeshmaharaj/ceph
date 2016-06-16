@@ -61,7 +61,6 @@ using namespace std;
 
 #define CEPH_OSD_PROTOCOL    10 /* cluster internal */
 
-
 enum {
   l_osd_first = 10000,
   l_osd_op_wip,

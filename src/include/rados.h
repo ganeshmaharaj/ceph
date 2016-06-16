@@ -295,7 +295,16 @@ extern const char *ceph_osd_state_name(int s);
 	f(PG_HITSET_GET, __CEPH_OSD_OP(RD, PG, 4),	"pg-hitset-get")    \
 	f(PGNLS,	__CEPH_OSD_OP(RD, PG, 5),	"pgnls")	    \
 	f(PGNLS_FILTER,	__CEPH_OSD_OP(RD, PG, 6),	"pgnls-filter")     \
-	f(SCRUBLS, __CEPH_OSD_OP(RD, PG, 7), "scrubls")
+	f(SCRUBLS, __CEPH_OSD_OP(RD, PG, 7), "scrubls")			    \
+									    \
+	/* modified by omw */						    \
+	/** deduplication **/						    \
+	f(DEDUPE_READ,		__CEPH_OSD_OP(RD, DATA, 38),	"dedupe_read")		    \
+	f(DEDUPE_GETXATTR,	__CEPH_OSD_OP(RD, ATTR, 39),	"dedupe_getxattr")	    \
+	f(DEDUPE_GETXATTRS,	__CEPH_OSD_OP(RD, ATTR, 40),	"dedupe_getxattrs")	    \
+	f(DEDUPE_WRITE,	__CEPH_OSD_OP(WR, DATA, 41),	"dedupe_write")	    \
+	f(DEDUPE_SETXATTR,	__CEPH_OSD_OP(RMW, ATTR, 42),	"dedupe_setxattr")	    \
+	f(DEDUPE_SETXATTRS,	__CEPH_OSD_OP(RMW, ATTR, 43),	"dedupe_setxattrs")	    \
 
 enum {
 #define GENERATE_ENUM_ENTRY(op, opcode, str)	CEPH_OSD_OP_##op = (opcode),
@@ -406,6 +415,13 @@ enum {
 	CEPH_OSD_FLAG_KNOWN_REDIR = 0x400000,  /* redirect bit is authoritative */
 	CEPH_OSD_FLAG_FULL_TRY =    0x800000,  /* try op despite full flag */
 	CEPH_OSD_FLAG_FULL_FORCE = 0x1000000,  /* force op despite full flag */
+	/* modified by omw */
+	CEPH_OSD_FLAG_DEDUPE_READ =           0x2000000,  /* op may read */
+	CEPH_OSD_FLAG_DEDUPE_WRITE =          0x4000000,  /* op may write */
+	CEPH_OSD_FLAG_DEDUPE_COPYGET_UPWARD =          0x8000000,  /* op may reverse read */
+	CEPH_OSD_FLAG_DEDUPE_COPYGET_DOWNWARD =          0x10000000,  /* op may reverse read */
+	CEPH_OSD_FLAG_DEDUPE_COPYGET_CAS_READ =          0x20000000,  /* op may read */
+	CEPH_OSD_FLAG_DEDUPE_COPYGET_CAS_DOWNWARD =          0x40000000,  /* op may cas reverse read */
 };
 
 enum {
@@ -443,6 +459,18 @@ enum {
 	CEPH_OSD_COPY_FROM_FLAG_MAP_SNAP_CLONE = 8, /* map snap direct to
 						     * cloneid */
 	CEPH_OSD_COPY_FROM_FLAG_RWORDERED = 16, /* order with write */
+};
+
+// modified by omw
+enum {
+	CEPH_OSD_COPY_GET_FLAG_DEDUPE_UPWARD = 32,
+};
+
+// modified by omw
+enum {
+	CEPH_OSD_COPY_FROM_FLAG_DEDUPE_DOWNWARD = 64,
+	CEPH_OSD_COPY_FROM_FLAG_DEDUPED_CAS_DOWNWARD = 128,
+	CEPH_OSD_COPY_FROM_FLAG_DEDUPE_ONLY_META = 256, 
 };
 
 enum {
