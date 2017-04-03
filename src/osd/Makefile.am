@@ -53,7 +53,8 @@ noinst_HEADERS += \
 	osd/Watch.h \
 	osd/ScrubStore.h \
 	osd/osd_types.h \
-	osd/Dedup.h
+	osd/Dedup.h	\
+	osd/Dedup_ISAL.h
 
 endif # WITH_OSD
 endif # ENABLE_SERVER
