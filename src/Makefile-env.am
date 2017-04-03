@@ -189,6 +189,8 @@ if LINUX
 EXTRALIBS += -lrt
 endif # LINUX
 
+EXTRALIBS += -lisal_crypto
+
 if WITH_PROFILER
 EXTRALIBS += -lprofiler
 endif # PROFILER

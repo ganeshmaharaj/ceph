@@ -1,5 +1,8 @@
 
 #include "Dedup.h"
+#include "Dedup_ISAL.h"
+
+#define USING_ISAL
 
 bool ChunknFP::do_cnf(bufferlist & list) 
 {
@@ -78,12 +81,27 @@ bool ChunknFP::do_fingerprint(bufferlist & list, ChunkData & cd)
 
   generic_dout(20) << __func__ << " " << __LINE__ << " data size: " << total_size
 	  << dendl;
+#ifdef USING_ISAL
+  if (chunk_mode == FIXED_CHUNK) {
+      //unsigned char fingerprint[CEPH_CRYPTO_SHA1_DIGESTSIZE] = {0};
+      if (fp_mode == FP_SHA1) {
+    	  IsalFPRef isalnf(std::make_shared<IsalFP>(cd.chunks.size(), FP_SHA1));
+    	  isalnf->fp_submit(ptr,cd);
+    	  isalnf->fp_finish(cd);
+      }else {
+		assert(0);
+      }
+	} else {
+		  assert(0);
+  }
+#else
   for (vector<ChunkEntry *>::iterator i = cd.chunks.begin();
       i != cd.chunks.end(); 
       ++i) {
     if (chunk_mode == FIXED_CHUNK) {
       //unsigned char fingerprint[CEPH_CRYPTO_SHA1_DIGESTSIZE] = {0};
       if (fp_mode == FP_SHA1) {
+
 	SHA1 sha1_gen;
 	//SHA_CTX sha1_gen;
 	//SHA1_Init(&sha1_gen);
@@ -95,7 +113,6 @@ bool ChunknFP::do_fingerprint(bufferlist & list, ChunkData & cd)
 	SHA1().CalculateDigest((unsigned char*)(*i)->fingerprint,
 			  (const unsigned char *)ptr+(*i)->start_pos, (*i)->len);
 #endif
-
 	//sha1_gen.Update((const unsigned char *)ptr+(*i)->start_pos, (*i)->len);
 	//sha1_gen.Final((unsigned char *)((*i)->fingerprint));
 	generic_dout(20) << __func__ << " " << __LINE__ << " data pos: " << (*i)->start_pos
@@ -107,6 +124,7 @@ bool ChunknFP::do_fingerprint(bufferlist & list, ChunkData & cd)
       assert(0);
     }
   }
+#endif
   return true;
 }
 
