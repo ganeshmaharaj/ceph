@@ -2,14 +2,14 @@
 #include "Dedup.h"
 #include "Dedup_ISAL.h"
 
-#define USING_ISAL
+#define USING_ISAL  1
 
 bool ChunknFP::do_cnf(bufferlist & list) 
 {
   generic_dout(20) << __func__ << " " << __LINE__ << " chunk_mode: " << chunk_mode 
 	  << " fp_mode: " << fp_mode << 
 	  " chunk_size: " << chunk_size << " buffer length: " << list.length() <<  dendl;
-
+  out <<"---do_chunk------"<<" ";
   if (!chunk_data(list, cd)) {
     assert(0);
   }
@@ -85,6 +85,8 @@ bool ChunknFP::do_fingerprint(bufferlist & list, ChunkData & cd)
   if (chunk_mode == FIXED_CHUNK) {
       //unsigned char fingerprint[CEPH_CRYPTO_SHA1_DIGESTSIZE] = {0};
       if (fp_mode == FP_SHA1) {
+
+  out <<"---using_ISAL------"<<" ";
     	  IsalFPRef isalnf(std::make_shared<IsalFP>(cd.chunks.size(), FP_SHA1));
     	  isalnf->fp_submit(ptr,cd);
     	  isalnf->fp_finish(cd);
