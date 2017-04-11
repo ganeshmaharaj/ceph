@@ -1,11 +1,12 @@
 
 #include "Dedup.h"
 #include "Dedup_ISAL.h"
-
+#include <sstream>
 #define USING_ISAL  1
 
 bool ChunknFP::do_cnf(bufferlist & list) 
-{
+{ 
+  stringstream out;
   generic_dout(20) << __func__ << " " << __LINE__ << " chunk_mode: " << chunk_mode 
 	  << " fp_mode: " << fp_mode << 
 	  " chunk_size: " << chunk_size << " buffer length: " << list.length() <<  dendl;
@@ -73,6 +74,7 @@ bool ChunknFP::chunk_data(bufferlist & list, ChunkData & cd)
 
 bool ChunknFP::do_fingerprint(bufferlist & list, ChunkData & cd)
 {
+  stringstream out;
   char * ptr = list.c_str();
   if (!ptr) {
     return false;
