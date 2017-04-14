@@ -89,7 +89,7 @@ bool ChunknFP::do_fingerprint(bufferlist & list, ChunkData & cd)
       if (fp_mode == FP_SHA1) {
 
   out <<"---using_ISAL------"<<" ";
-    	  IsalFPRef isalnf(std::make_shared<IsalFP>(cd.chunks.size(), FP_SHA1));
+    	  IsalFPRef isalnf(std::make_shared<IsalFP>(SHA1_MAX_LANES, FP_SHA1));
     	  isalnf->fp_submit(ptr,cd);
     	  isalnf->fp_finish(cd);
       }else {
