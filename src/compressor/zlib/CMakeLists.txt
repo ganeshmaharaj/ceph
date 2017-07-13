@@ -4,6 +4,8 @@ if(HAVE_INTEL_SSE4_1 AND HAVE_BETTER_YASM_ELF64 AND (NOT APPLE))
 	set(zlib_sources
 	  CompressionPluginZlib.cc
 	  ZlibCompressor.cc
+	  ${CMAKE_SOURCE_DIR}/src/isa-l/igzip/adler32_avx2_4.asm
+	  ${CMAKE_SOURCE_DIR}/src/isa-l/igzip/adler32_sse.asm
 	  ${CMAKE_SOURCE_DIR}/src/isa-l/igzip/crc32_gzip.asm
 	  ${CMAKE_SOURCE_DIR}/src/isa-l/igzip/crc32_gzip_base.c
 	  ${CMAKE_SOURCE_DIR}/src/isa-l/igzip/detect_repeated_char.asm
@@ -18,6 +20,7 @@ if(HAVE_INTEL_SSE4_1 AND HAVE_BETTER_YASM_ELF64 AND (NOT APPLE))
 	  ${CMAKE_SOURCE_DIR}/src/isa-l/igzip/igzip_body_01.asm
 	  ${CMAKE_SOURCE_DIR}/src/isa-l/igzip/igzip_body_02.asm
 	  ${CMAKE_SOURCE_DIR}/src/isa-l/igzip/igzip_body_04.asm
+	  ${CMAKE_SOURCE_DIR}/src/isa-l/igzip/igzip_deflate_hash.asm
 	  ${CMAKE_SOURCE_DIR}/src/isa-l/igzip/igzip_finish.asm
 	  ${CMAKE_SOURCE_DIR}/src/isa-l/igzip/igzip_icf_base.c
 	  ${CMAKE_SOURCE_DIR}/src/isa-l/igzip/igzip_icf_body_01.asm
