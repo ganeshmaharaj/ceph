@@ -903,9 +903,7 @@ if(WITH_TESTS AND WITH_DMCLOCK_TESTS)
   add_subdirectory(dmclock/support/test)
 endif(WITH_TESTS AND WITH_DMCLOCK_TESTS)
 
-if(HAVE_INTEL AND HAVE_BETTER_YASM_ELF64)
-  add_subdirectory(crypto/isa-l)
-endif(HAVE_INTEL AND HAVE_BETTER_YASM_ELF64)
+add_subdirectory(crypto)
 
 if(WITH_TESTS)
 
