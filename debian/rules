@@ -5,7 +5,7 @@ export DESTDIR=$(CURDIR)/debian/tmp
 
 export DEB_HOST_ARCH      ?= $(shell dpkg-architecture -qDEB_HOST_ARCH)
 
-extraopts += -DUSE_CRYPTOPP=ON -DWITH_NSS=OFF -DWITH_OCF=ON -DWITH_LTTNG=ON -DWITH_PYTHON3=ON -DWITH_EMBEDDED=OFF
+extraopts += -DUSE_CRYPTOPP=OFF -DWITH_NSS=ON -DWITH_OCF=ON -DWITH_LTTNG=ON -DWITH_PYTHON3=ON -DWITH_EMBEDDED=OFF
 extraopts += -DWITH_CEPHFS_JAVA=ON
 # assumes that ceph is exmpt from multiarch support, so we override the libdir.
 extraopts += -DCMAKE_INSTALL_LIBDIR=/usr/lib
@@ -161,7 +161,7 @@ override_dh_strip:
 	dh_strip -pceph-test --dbg-package=ceph-test-dbg
 
 override_dh_shlibdeps:
-	dh_shlibdeps -a --exclude=erasure-code --exclude=rados-classes --exclude=compressor
+	dh_shlibdeps -l/usr/local/ssl/lib -Xopenssl -a --exclude=erasure-code --exclude=rados-classes --exclude=compressor
 
 override_dh_python2:
 	for binding in rados cephfs rbd rgw; do \
